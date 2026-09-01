@@ -10,11 +10,13 @@ An offline Android burst processor that aligns DNG/image frames, rejects poor ma
 
 Higher resolution modes do not invent detail with a generative model. They combine differently shifted samples from the burst and interpolate the remaining output grid.
 
-## What v0.2 does
+## What v0.3 does
 
 - Android Storage Access Framework multi-select (no broad storage permission)
 - DNG providers with non-image MIME types are supported; bursts are capped at 30 frames
-- DNG/image decode through Android `ImageDecoder`
+- direct uncompressed Bayer DNG decoding, including MotionCam packed 10-bit DNGs
+- black/white-level correction, Bayer demosaic, AsShotNeutral white balance, and DNG color-matrix rendering
+- Android `ImageDecoder` support for ordinary rendered image inputs
 - automatic reference selection by Laplacian sharpness score
 - higher-resolution coarse-to-fine gradient registration with fractional shift refinement
 - per-frame exposure normalization and sharpness/alignment quality weighting
@@ -27,7 +29,7 @@ Higher resolution modes do not invent detail with a generative model. They combi
 
 ## Important limitation
 
-This is a rendered-image fusion pipeline, **not yet true Bayer/CFA RAW super-resolution**. Android `ImageDecoder` renders each selected DNG before the app receives its pixels, so the current output is an 8-bit RGB TIFF. A future native engine should use a DNG/RAW decoder to extract original mosaic samples, preserve black/white levels and CFA metadata, perform local alignment and motion rejection, reconstruct the Bayer plane, demosaic once at the end, and write a high-bit-depth TIFF or standards-compliant DNG.
+The app now reads uncompressed Bayer DNG input directly, but it currently demosaics every frame before alignment and fusion. The output is therefore an 8-bit RGB TIFF, not a new sensor-raw DNG. A future engine should align and merge the original CFA samples, demosaic only once after fusion, and write a high-bit-depth TIFF or standards-compliant DNG. Compressed DNG variants are not yet supported by the built-in decoder.
 
 The design is informed by Google's published burst photography and handheld multi-frame super-resolution work:
 

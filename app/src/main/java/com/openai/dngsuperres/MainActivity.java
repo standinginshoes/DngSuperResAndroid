@@ -87,7 +87,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Offline multi-frame denoise + super resolution • v0.2");
+        subtitle.setText("Offline multi-frame denoise + super resolution • v0.3");
         subtitle.setTextSize(15);
         subtitle.setTextColor(Color.DKGRAY);
         subtitle.setPadding(0, 0, 0, dp(18));
@@ -410,23 +410,31 @@ public class MainActivity extends Activity {
     }
 
     private Bitmap decodePreview(Uri uri) throws Exception {
-        ImageDecoder.Source source = ImageDecoder.createSource(getContentResolver(), uri);
-        return ImageDecoder.decodeBitmap(source, (decoder, info, src) -> {
-            int w = info.getSize().getWidth();
-            int h = info.getSize().getHeight();
-            float scale = Math.min(1f, PREVIEW_MAX / (float)Math.max(w, h));
-            decoder.setTargetSize(Math.max(32, Math.round(w * scale)), Math.max(32, Math.round(h * scale)));
-            decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
-            decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM);
-        });
+        try {
+            ImageDecoder.Source source = ImageDecoder.createSource(getContentResolver(), uri);
+            return ImageDecoder.decodeBitmap(source, (decoder, info, src) -> {
+                int w = info.getSize().getWidth();
+                int h = info.getSize().getHeight();
+                float scale = Math.min(1f, PREVIEW_MAX / (float)Math.max(w, h));
+                decoder.setTargetSize(Math.max(32, Math.round(w * scale)), Math.max(32, Math.round(h * scale)));
+                decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
+                decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM);
+            });
+        } catch (Exception imageDecoderFailure) {
+            return DngDecoder.decode(getContentResolver(), uri, PREVIEW_MAX);
+        }
     }
 
     private Bitmap decodeFull(Uri uri) throws Exception {
-        ImageDecoder.Source source = ImageDecoder.createSource(getContentResolver(), uri);
-        return ImageDecoder.decodeBitmap(source, (decoder, info, src) -> {
-            decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
-            decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM);
-        });
+        try {
+            ImageDecoder.Source source = ImageDecoder.createSource(getContentResolver(), uri);
+            return ImageDecoder.decodeBitmap(source, (decoder, info, src) -> {
+                decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
+                decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM);
+            });
+        } catch (Exception imageDecoderFailure) {
+            return DngDecoder.decode(getContentResolver(), uri, 0);
+        }
     }
 
     private double sharpness(Bitmap b) {
