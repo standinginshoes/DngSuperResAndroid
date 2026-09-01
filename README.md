@@ -10,11 +10,13 @@ An offline Android burst processor that aligns DNG/image frames, rejects poor ma
 
 Higher resolution modes do not invent detail with a generative model. They combine differently shifted samples from the burst and interpolate the remaining output grid.
 
-## What v0.3 does
+## What v0.4 does
 
 - Android Storage Access Framework multi-select (no broad storage permission)
 - DNG providers with non-image MIME types are supported; bursts are capped at 30 frames
 - direct uncompressed Bayer DNG decoding, including MotionCam packed 10-bit DNGs
+- disk-backed DNG input with row-sized read buffers to avoid whole-file heap allocations
+- Android large-heap mode plus runtime memory checks for full-resolution fusion
 - black/white-level correction, Bayer demosaic, AsShotNeutral white balance, and DNG color-matrix rendering
 - Android `ImageDecoder` support for ordinary rendered image inputs
 - automatic reference selection by Laplacian sharpness score

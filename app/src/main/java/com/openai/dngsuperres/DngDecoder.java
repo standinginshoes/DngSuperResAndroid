@@ -1,13 +1,16 @@
 package com.openai.dngsuperres;
 
 import android.content.ContentResolver;
+import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
 
-import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -20,7 +23,7 @@ final class DngDecoder {
     private static final int TIFF_MAGIC = 42;
     private static final int PHOTOMETRIC_CFA = 32803;
     private static final int COMPRESSION_NONE = 1;
-    private static final int MAX_INPUT_BYTES = 256 * 1024 * 1024;
+    private static final long MAX_INPUT_BYTES = 1024L * 1024L * 1024L;
 
     private static final int TAG_NEW_SUBFILE_TYPE = 254;
     private static final int TAG_WIDTH = 256;
@@ -52,39 +55,50 @@ final class DngDecoder {
 
     private DngDecoder() { }
 
-    static Bitmap decode(ContentResolver resolver, Uri uri, int maxDimension) throws IOException {
-        byte[] bytes = readAll(resolver, uri);
-        Tiff tiff = new Tiff(bytes);
-        RawIfd raw = tiff.findRawIfd();
-        if (raw.compression != COMPRESSION_NONE) {
-            throw new IOException("This DNG uses unsupported compression " + raw.compression
-                    + ". This build currently supports uncompressed Bayer DNGs.");
-        }
-        if (raw.cfaWidth != 2 || raw.cfaHeight != 2 || raw.cfaPattern.length < 4) {
-            throw new IOException("This DNG uses an unsupported CFA layout. A standard 2×2 Bayer pattern is required.");
-        }
+    static Bitmap decode(Context context, Uri uri, int maxDimension) throws IOException {
+        File cachedDng = copyToCache(context.getContentResolver(), uri, context.getCacheDir());
+        try (RandomAccessFile file = new RandomAccessFile(cachedDng, "r")) {
+            Tiff tiff = new Tiff(file);
+            RawIfd raw = tiff.findRawIfd();
+            if (raw.compression != COMPRESSION_NONE) {
+                throw new IOException("This DNG uses unsupported compression " + raw.compression
+                        + ". This build currently supports uncompressed Bayer DNGs.");
+            }
+            if (raw.cfaWidth != 2 || raw.cfaHeight != 2 || raw.cfaPattern.length < 4) {
+                throw new IOException("This DNG uses an unsupported CFA layout. A standard 2×2 Bayer pattern is required.");
+            }
 
-        short[] mosaic = unpackMosaic(bytes, tiff.littleEndian, raw);
-        return render(raw, mosaic, maxDimension);
+            short[] mosaic = unpackMosaic(file, tiff.littleEndian, raw);
+            return render(raw, mosaic, maxDimension);
+        } finally {
+            // The cache copy contains the user's image data and is never retained after decoding.
+            if (!cachedDng.delete()) cachedDng.deleteOnExit();
+        }
     }
 
-    private static byte[] readAll(ContentResolver resolver, Uri uri) throws IOException {
+    private static File copyToCache(ContentResolver resolver, Uri uri, File cacheDirectory) throws IOException {
+        File outputFile = File.createTempFile("dng_decode_", ".dng", cacheDirectory);
+        boolean complete = false;
         try (InputStream input = resolver.openInputStream(uri)) {
             if (input == null) throw new IOException("Could not open the selected file.");
-            ByteArrayOutputStream output = new ByteArrayOutputStream(16 * 1024 * 1024);
-            byte[] buffer = new byte[64 * 1024];
-            int total = 0;
-            int count;
-            while ((count = input.read(buffer)) != -1) {
-                total += count;
-                if (total > MAX_INPUT_BYTES) throw new IOException("DNG is larger than the 256 MB safety limit.");
-                output.write(buffer, 0, count);
+            try (FileOutputStream output = new FileOutputStream(outputFile)) {
+                byte[] buffer = new byte[128 * 1024];
+                long total = 0;
+                int count;
+                while ((count = input.read(buffer)) != -1) {
+                    total += count;
+                    if (total > MAX_INPUT_BYTES) throw new IOException("DNG is larger than the 1 GB safety limit.");
+                    output.write(buffer, 0, count);
+                }
+                complete = true;
             }
-            return output.toByteArray();
+        } finally {
+            if (!complete && !outputFile.delete()) outputFile.deleteOnExit();
         }
+        return outputFile;
     }
 
-    private static short[] unpackMosaic(byte[] bytes, boolean littleEndian, RawIfd raw) throws IOException {
+    private static short[] unpackMosaic(RandomAccessFile file, boolean littleEndian, RawIfd raw) throws IOException {
         long pixelCountLong = (long)raw.width * raw.height;
         if (pixelCountLong <= 0 || pixelCountLong > Integer.MAX_VALUE) {
             throw new IOException("DNG dimensions are too large.");
@@ -101,36 +115,37 @@ final class DngDecoder {
         long rowBytesLong = ((long)raw.width * bits + 7L) / 8L;
         if (rowBytesLong > Integer.MAX_VALUE) throw new IOException("DNG row is too large.");
         int rowBytes = (int)rowBytesLong;
+        byte[] packedRow = new byte[rowBytes];
 
         for (int y = 0; y < raw.height; y++) {
             int strip = Math.min(raw.stripOffsets.length - 1, y / raw.rowsPerStrip);
             int rowInStrip = y - strip * raw.rowsPerStrip;
             long rowOffsetLong = raw.stripOffsets[strip] + (long)rowInStrip * rowBytes;
-            if (rowOffsetLong < 0 || rowOffsetLong + rowBytes > bytes.length) {
+            if (rowOffsetLong < 0 || rowOffsetLong + rowBytes > file.length()) {
                 throw new IOException("DNG pixel strip is truncated.");
             }
-            int rowOffset = (int)rowOffsetLong;
+            file.seek(rowOffsetLong);
+            file.readFully(packedRow);
             int destination = y * raw.width;
             if (bits == 16) {
                 for (int x = 0; x < raw.width; x++) {
-                    int offset = rowOffset + x * 2;
+                    int offset = x * 2;
                     int value = littleEndian
-                            ? (bytes[offset] & 255) | ((bytes[offset + 1] & 255) << 8)
-                            : ((bytes[offset] & 255) << 8) | (bytes[offset + 1] & 255);
+                            ? (packedRow[offset] & 255) | ((packedRow[offset + 1] & 255) << 8)
+                            : ((packedRow[offset] & 255) << 8) | (packedRow[offset + 1] & 255);
                     mosaic[destination + x] = (short)value;
                 }
             } else if (bits == 8) {
-                for (int x = 0; x < raw.width; x++) mosaic[destination + x] = (short)(bytes[rowOffset + x] & 255);
+                for (int x = 0; x < raw.width; x++) mosaic[destination + x] = (short)(packedRow[x] & 255);
             } else {
                 int mask = (1 << bits) - 1;
-                int rowEnd = rowOffset + rowBytes;
                 for (int x = 0; x < raw.width; x++) {
                     int bit = x * bits;
-                    int offset = rowOffset + (bit >>> 3);
+                    int offset = bit >>> 3;
                     int bitInByte = bit & 7;
-                    int packed = (bytes[offset] & 255) << 16;
-                    if (offset + 1 < rowEnd) packed |= (bytes[offset + 1] & 255) << 8;
-                    if (offset + 2 < rowEnd) packed |= bytes[offset + 2] & 255;
+                    int packed = (packedRow[offset] & 255) << 16;
+                    if (offset + 1 < rowBytes) packed |= (packedRow[offset + 1] & 255) << 8;
+                    if (offset + 2 < rowBytes) packed |= packedRow[offset + 2] & 255;
                     int shift = 24 - bitInByte - bits;
                     mosaic[destination + x] = (short)((packed >>> shift) & mask);
                 }
@@ -310,15 +325,19 @@ final class DngDecoder {
     }
 
     private static final class Tiff {
-        final byte[] bytes;
+        final RandomAccessFile file;
+        final long length;
         final boolean littleEndian;
         final int firstIfd;
 
-        Tiff(byte[] bytes) throws IOException {
-            this.bytes = bytes;
-            if (bytes.length < 8) throw new IOException("Selected file is not a valid DNG/TIFF.");
-            if (bytes[0] == 'I' && bytes[1] == 'I') littleEndian = true;
-            else if (bytes[0] == 'M' && bytes[1] == 'M') littleEndian = false;
+        Tiff(RandomAccessFile file) throws IOException {
+            this.file = file;
+            length = file.length();
+            if (length < 8) throw new IOException("Selected file is not a valid DNG/TIFF.");
+            int first = u8Raw(0);
+            int second = u8Raw(1);
+            if (first == 'I' && second == 'I') littleEndian = true;
+            else if (first == 'M' && second == 'M') littleEndian = false;
             else throw new IOException("Selected file is not a valid DNG/TIFF.");
             if (u16(2) != TIFF_MAGIC) throw new IOException("Unsupported TIFF header.");
             firstIfd = checkedOffset(u32(4));
@@ -354,19 +373,35 @@ final class DngDecoder {
 
         int u16(int offset) throws IOException {
             check(offset, 2);
+            file.seek(offset);
+            int first = file.readUnsignedByte();
+            int second = file.readUnsignedByte();
             return littleEndian
-                    ? (bytes[offset] & 255) | ((bytes[offset + 1] & 255) << 8)
-                    : ((bytes[offset] & 255) << 8) | (bytes[offset + 1] & 255);
+                    ? first | (second << 8)
+                    : (first << 8) | second;
         }
 
         long u32(int offset) throws IOException {
             check(offset, 4);
+            file.seek(offset);
+            long first = file.readUnsignedByte();
+            long second = file.readUnsignedByte();
+            long third = file.readUnsignedByte();
+            long fourth = file.readUnsignedByte();
             if (littleEndian) {
-                return (bytes[offset] & 255L) | ((bytes[offset + 1] & 255L) << 8)
-                        | ((bytes[offset + 2] & 255L) << 16) | ((bytes[offset + 3] & 255L) << 24);
+                return first | (second << 8) | (third << 16) | (fourth << 24);
             }
-            return ((bytes[offset] & 255L) << 24) | ((bytes[offset + 1] & 255L) << 16)
-                    | ((bytes[offset + 2] & 255L) << 8) | (bytes[offset + 3] & 255L);
+            return (first << 24) | (second << 16) | (third << 8) | fourth;
+        }
+
+        int u8(int offset) throws IOException {
+            check(offset, 1);
+            return u8Raw(offset);
+        }
+
+        private int u8Raw(long offset) throws IOException {
+            file.seek(offset);
+            return file.readUnsignedByte();
         }
 
         int s32(int offset) throws IOException {
@@ -374,14 +409,14 @@ final class DngDecoder {
         }
 
         int checkedOffset(long value) throws IOException {
-            if (value < 0 || value > Integer.MAX_VALUE || value >= bytes.length) {
+            if (value < 0 || value > Integer.MAX_VALUE || value >= length) {
                 throw new IOException("DNG contains an invalid offset.");
             }
             return (int)value;
         }
 
         void check(int offset, long length) throws IOException {
-            if (offset < 0 || length < 0 || offset + length > bytes.length) {
+            if (offset < 0 || length < 0 || offset + length > this.length) {
                 throw new IOException("DNG metadata is truncated.");
             }
         }
@@ -474,7 +509,7 @@ final class DngDecoder {
                     case 1:
                     case 6:
                     case 7:
-                        result[i] = tiff.bytes[offset] & 255;
+                        result[i] = tiff.u8(offset);
                         break;
                     case 3:
                     case 8:

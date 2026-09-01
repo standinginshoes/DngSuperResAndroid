@@ -87,7 +87,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Offline multi-frame denoise + super resolution • v0.3");
+        subtitle.setText("Offline multi-frame denoise + super resolution • v0.4");
         subtitle.setTextSize(15);
         subtitle.setTextColor(Color.DKGRAY);
         subtitle.setPadding(0, 0, 0, dp(18));
@@ -389,14 +389,15 @@ public class MainActivity extends Activity {
                 });
             } catch (Throwable t) {
                 runOnUiThread(() -> {
-                    status.setText(t instanceof ProcessingCancelledException ? "Processing cancelled" : "Processing failed: " + t.getMessage());
+                    String errorMessage = friendlyError(t);
+                    status.setText(t instanceof ProcessingCancelledException ? "Processing cancelled" : "Processing failed: " + errorMessage);
                     processButton.setEnabled(true);
                     selectButton.setEnabled(true);
                     resolutionSpinner.setEnabled(true);
                     cancelButton.setEnabled(false);
                     saveButton.setEnabled(false);
                     if (!(t instanceof ProcessingCancelledException)) {
-                        Toast.makeText(this, t.getMessage(), Toast.LENGTH_LONG).show();
+                        Toast.makeText(this, errorMessage, Toast.LENGTH_LONG).show();
                     }
                 });
             } finally {
@@ -407,6 +408,14 @@ public class MainActivity extends Activity {
                 if (out != null && out != resultBitmap && !out.isRecycled()) out.recycle();
             }
         });
+    }
+
+    private String friendlyError(Throwable error) {
+        if (error instanceof OutOfMemoryError) {
+            return "The device ran out of image memory. Restart the app, select fewer frames, and use 1× output.";
+        }
+        String message = error.getMessage();
+        return message == null || message.trim().isEmpty() ? error.getClass().getSimpleName() : message;
     }
 
     private Bitmap decodePreview(Uri uri) throws Exception {
@@ -421,7 +430,7 @@ public class MainActivity extends Activity {
                 decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM);
             });
         } catch (Exception imageDecoderFailure) {
-            return DngDecoder.decode(getContentResolver(), uri, PREVIEW_MAX);
+            return DngDecoder.decode(getApplicationContext(), uri, PREVIEW_MAX);
         }
     }
 
@@ -433,7 +442,7 @@ public class MainActivity extends Activity {
                 decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM);
             });
         } catch (Exception imageDecoderFailure) {
-            return DngDecoder.decode(getContentResolver(), uri, 0);
+            return DngDecoder.decode(getApplicationContext(), uri, 0);
         }
     }
 
