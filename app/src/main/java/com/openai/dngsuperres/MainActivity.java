@@ -87,7 +87,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Offline multi-frame denoise + super resolution • v0.4");
+        subtitle.setText("Offline multi-frame denoise + super resolution • v0.5");
         subtitle.setTextSize(15);
         subtitle.setTextColor(Color.DKGRAY);
         subtitle.setPadding(0, 0, 0, dp(18));

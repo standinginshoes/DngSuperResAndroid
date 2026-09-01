@@ -21,7 +21,9 @@ import java.util.Set;
 /** Minimal decoder for uncompressed Bayer DNG files, including MotionCam packed 10-bit DNGs. */
 final class DngDecoder {
     private static final int TIFF_MAGIC = 42;
+    private static final int PHOTOMETRIC_RGB = 2;
     private static final int PHOTOMETRIC_CFA = 32803;
+    private static final int PHOTOMETRIC_LINEAR_RAW = 34892;
     private static final int COMPRESSION_NONE = 1;
     private static final long MAX_INPUT_BYTES = 1024L * 1024L * 1024L;
 
@@ -32,8 +34,10 @@ final class DngDecoder {
     private static final int TAG_COMPRESSION = 259;
     private static final int TAG_PHOTOMETRIC = 262;
     private static final int TAG_STRIP_OFFSETS = 273;
+    private static final int TAG_SAMPLES_PER_PIXEL = 277;
     private static final int TAG_ROWS_PER_STRIP = 278;
     private static final int TAG_STRIP_BYTE_COUNTS = 279;
+    private static final int TAG_PLANAR_CONFIGURATION = 284;
     private static final int TAG_SUB_IFDS = 330;
     private static final int TAG_CFA_REPEAT = 33421;
     private static final int TAG_CFA_PATTERN = 33422;
@@ -59,17 +63,26 @@ final class DngDecoder {
         File cachedDng = copyToCache(context.getContentResolver(), uri, context.getCacheDir());
         try (RandomAccessFile file = new RandomAccessFile(cachedDng, "r")) {
             Tiff tiff = new Tiff(file);
-            RawIfd raw = tiff.findRawIfd();
-            if (raw.compression != COMPRESSION_NONE) {
-                throw new IOException("This DNG uses unsupported compression " + raw.compression
-                        + ". This build currently supports uncompressed Bayer DNGs.");
+            Ifd imageIfd = tiff.findBestImageIfd();
+            int photometric = imageIfd.intValue(TAG_PHOTOMETRIC, -1);
+            boolean hasCfaMetadata = imageIfd.entries.containsKey(TAG_CFA_PATTERN);
+            if (photometric == PHOTOMETRIC_CFA || hasCfaMetadata) {
+                RawIfd raw = new RawIfd(imageIfd);
+                if (raw.compression != COMPRESSION_NONE) {
+                    throw new IOException("This Bayer DNG uses unsupported compression " + raw.compression + ".");
+                }
+                if (raw.cfaWidth != 2 || raw.cfaHeight != 2 || raw.cfaPattern.length < 4) {
+                    throw new IOException("This DNG uses an unsupported CFA layout. A standard 2×2 Bayer pattern is required.");
+                }
+                short[] mosaic = unpackMosaic(file, tiff.littleEndian, raw);
+                return render(raw, mosaic, maxDimension);
             }
-            if (raw.cfaWidth != 2 || raw.cfaHeight != 2 || raw.cfaPattern.length < 4) {
-                throw new IOException("This DNG uses an unsupported CFA layout. A standard 2×2 Bayer pattern is required.");
+            if (photometric == PHOTOMETRIC_RGB || photometric == PHOTOMETRIC_LINEAR_RAW) {
+                RgbIfd rgb = new RgbIfd(imageIfd, photometric == PHOTOMETRIC_LINEAR_RAW);
+                return renderRgb(file, tiff.littleEndian, rgb, maxDimension);
             }
-
-            short[] mosaic = unpackMosaic(file, tiff.littleEndian, raw);
-            return render(raw, mosaic, maxDimension);
+            throw new IOException("Unsupported DNG image layout (photometric " + photometric
+                    + ", samples " + imageIfd.intValue(TAG_SAMPLES_PER_PIXEL, 1) + ").");
         } finally {
             // The cache copy contains the user's image data and is never retained after decoding.
             if (!cachedDng.delete()) cachedDng.deleteOnExit();
@@ -201,6 +214,102 @@ final class DngDecoder {
         return output;
     }
 
+    private static Bitmap renderRgb(RandomAccessFile file, boolean littleEndian, RgbIfd rgb,
+                                    int maxDimension) throws IOException {
+        if (rgb.compression != COMPRESSION_NONE) {
+            throw new IOException("This RGB/LinearRaw DNG uses unsupported compression " + rgb.compression + ".");
+        }
+        if (rgb.planarConfiguration != 1) {
+            throw new IOException("Planar RGB DNG data is not supported yet.");
+        }
+        float scale = maxDimension <= 0 ? 1f
+                : Math.min(1f, maxDimension / (float)Math.max(rgb.width, rgb.height));
+        int outputWidth = Math.max(1, Math.round(rgb.width * scale));
+        int outputHeight = Math.max(1, Math.round(rgb.height * scale));
+        Bitmap output;
+        try {
+            output = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888);
+        } catch (OutOfMemoryError error) {
+            throw new IOException("Not enough memory to render this RGB DNG. Try fewer frames.", error);
+        }
+
+        long rowBytesLong = ((long)rgb.width * rgb.samplesPerPixel * rgb.bitsPerSample + 7L) / 8L;
+        if (rowBytesLong <= 0 || rowBytesLong > Integer.MAX_VALUE) throw new IOException("RGB DNG row is too large.");
+        int rowBytes = (int)rowBytesLong;
+        byte[] packedRow = new byte[rowBytes];
+        int[] outputRow = new int[outputWidth];
+        float redBalance = rgb.asShotNeutral.length >= 3 && rgb.asShotNeutral[0] > 0f
+                ? rgb.asShotNeutral[1] / rgb.asShotNeutral[0] : 1f;
+        float blueBalance = rgb.asShotNeutral.length >= 3 && rgb.asShotNeutral[2] > 0f
+                ? rgb.asShotNeutral[1] / rgb.asShotNeutral[2] : 1f;
+        float[] rgbMatrix = rgb.linearRaw ? multiply3x3(XYZ_D50_TO_SRGB, rgb.cameraToXyz) : null;
+        int lastSourceY = -1;
+
+        for (int outputY = 0; outputY < outputHeight; outputY++) {
+            int sourceY = Math.min(rgb.height - 1,
+                    Math.max(0, (int)((outputY + 0.5f) * rgb.height / outputHeight)));
+            if (sourceY != lastSourceY) {
+                int strip = Math.min(rgb.stripOffsets.length - 1, sourceY / rgb.rowsPerStrip);
+                int rowInStrip = sourceY - strip * rgb.rowsPerStrip;
+                long rowOffset = rgb.stripOffsets[strip] + (long)rowInStrip * rowBytes;
+                if (rowOffset < 0 || rowOffset + rowBytes > file.length()) {
+                    throw new IOException("RGB DNG pixel strip is truncated.");
+                }
+                file.seek(rowOffset);
+                file.readFully(packedRow);
+                lastSourceY = sourceY;
+            }
+            for (int outputX = 0; outputX < outputWidth; outputX++) {
+                int sourceX = Math.min(rgb.width - 1,
+                        Math.max(0, (int)((outputX + 0.5f) * rgb.width / outputWidth)));
+                int firstSample = sourceX * rgb.samplesPerPixel;
+                float red = rgb.normalize(readPackedSample(packedRow, firstSample,
+                        rgb.bitsPerSample, littleEndian), 0);
+                float green = rgb.normalize(readPackedSample(packedRow, firstSample + 1,
+                        rgb.bitsPerSample, littleEndian), 1);
+                float blue = rgb.normalize(readPackedSample(packedRow, firstSample + 2,
+                        rgb.bitsPerSample, littleEndian), 2);
+                if (rgb.linearRaw) {
+                    red *= redBalance;
+                    blue *= blueBalance;
+                    float linearRed = rgbMatrix[0] * red + rgbMatrix[1] * green + rgbMatrix[2] * blue;
+                    float linearGreen = rgbMatrix[3] * red + rgbMatrix[4] * green + rgbMatrix[5] * blue;
+                    float linearBlue = rgbMatrix[6] * red + rgbMatrix[7] * green + rgbMatrix[8] * blue;
+                    outputRow[outputX] = Color.rgb(toSrgb8(linearRed), toSrgb8(linearGreen), toSrgb8(linearBlue));
+                } else {
+                    outputRow[outputX] = Color.rgb(toByte(red), toByte(green), toByte(blue));
+                }
+            }
+            output.setPixels(outputRow, 0, outputWidth, 0, outputY, outputWidth, 1);
+        }
+        return output;
+    }
+
+    private static int readPackedSample(byte[] row, int sampleIndex, int bits, boolean littleEndian) throws IOException {
+        if (bits == 8) return row[sampleIndex] & 255;
+        if (bits == 16) {
+            int offset = sampleIndex * 2;
+            if (offset + 1 >= row.length) throw new IOException("RGB DNG row is truncated.");
+            return littleEndian
+                    ? (row[offset] & 255) | ((row[offset + 1] & 255) << 8)
+                    : ((row[offset] & 255) << 8) | (row[offset + 1] & 255);
+        }
+        if (bits < 8 || bits > 16) throw new IOException("Unsupported RGB DNG bit depth: " + bits);
+        int bit = sampleIndex * bits;
+        int offset = bit >>> 3;
+        int bitInByte = bit & 7;
+        if (offset >= row.length) throw new IOException("RGB DNG row is truncated.");
+        int packed = (row[offset] & 255) << 16;
+        if (offset + 1 < row.length) packed |= (row[offset + 1] & 255) << 8;
+        if (offset + 2 < row.length) packed |= row[offset + 2] & 255;
+        int mask = (1 << bits) - 1;
+        return (packed >>> (24 - bitInByte - bits)) & mask;
+    }
+
+    private static int toByte(float value) {
+        return Math.max(0, Math.min(255, Math.round(Math.max(0f, Math.min(1f, value)) * 255f)));
+    }
+
     private static float averageColor(RawIfd raw, short[] mosaic, int x, int y, int wantedColor) {
         float sum = 0f;
         int count = 0;
@@ -256,6 +365,61 @@ final class DngDecoder {
         };
     }
 
+    private static final class RgbIfd {
+        final int width;
+        final int height;
+        final int bitsPerSample;
+        final int samplesPerPixel;
+        final int compression;
+        final int planarConfiguration;
+        final long[] stripOffsets;
+        final int rowsPerStrip;
+        final float[] blackLevel;
+        final float[] whiteLevel;
+        final float[] asShotNeutral;
+        final float[] cameraToXyz;
+        final boolean linearRaw;
+
+        RgbIfd(Ifd ifd, boolean linearRaw) throws IOException {
+            this.linearRaw = linearRaw;
+            width = ifd.requiredInt(TAG_WIDTH);
+            height = ifd.requiredInt(TAG_HEIGHT);
+            bitsPerSample = ifd.requiredInt(TAG_BITS_PER_SAMPLE);
+            samplesPerPixel = ifd.intValue(TAG_SAMPLES_PER_PIXEL, 3);
+            if (samplesPerPixel < 3) throw new IOException("RGB DNG has fewer than three color samples.");
+            compression = ifd.intValue(TAG_COMPRESSION, COMPRESSION_NONE);
+            planarConfiguration = ifd.intValue(TAG_PLANAR_CONFIGURATION, 1);
+            stripOffsets = ifd.requiredLongArray(TAG_STRIP_OFFSETS);
+            rowsPerStrip = Math.max(1, ifd.intValue(TAG_ROWS_PER_STRIP, height));
+            blackLevel = ifd.floatArray(TAG_BLACK_LEVEL, new float[]{0f, 0f, 0f});
+            float defaultWhite = (1 << Math.min(bitsPerSample, 16)) - 1f;
+            whiteLevel = ifd.floatArray(TAG_WHITE_LEVEL,
+                    new float[]{defaultWhite, defaultWhite, defaultWhite});
+            asShotNeutral = ifd.floatArray(TAG_AS_SHOT_NEUTRAL, new float[]{1f, 1f, 1f});
+            cameraToXyz = linearRaw ? cameraToXyz(ifd) : new float[]{
+                    1f, 0f, 0f,
+                    0f, 1f, 0f,
+                    0f, 0f, 1f
+            };
+        }
+
+        float normalize(int value, int channel) {
+            float black = blackLevel[Math.min(channel, blackLevel.length - 1)];
+            float white = whiteLevel[Math.min(channel, whiteLevel.length - 1)];
+            return Math.max(0f, (value - black) / Math.max(1f, white - black));
+        }
+    }
+
+    private static float[] cameraToXyz(Ifd ifd) throws IOException {
+        float[] forward = ifd.floatArray(TAG_FORWARD_MATRIX_2, null);
+        if (forward == null || forward.length < 9) forward = ifd.floatArray(TAG_FORWARD_MATRIX_1, null);
+        if (forward != null && forward.length >= 9) return RawIfd.copyMatrix(forward);
+        float[] color = ifd.floatArray(TAG_COLOR_MATRIX_2, null);
+        if (color == null || color.length < 9) color = ifd.floatArray(TAG_COLOR_MATRIX_1, null);
+        if (color == null || color.length < 9) throw new IOException("DNG has no usable color matrix.");
+        return invert3x3(RawIfd.copyMatrix(color));
+    }
+
     private static final class RawIfd {
         final int width;
         final int height;
@@ -294,16 +458,7 @@ final class DngDecoder {
             whiteLevel = white.length == 0 ? (1 << Math.min(bitsPerSample, 16)) - 1f : white[0];
             asShotNeutral = ifd.floatArray(TAG_AS_SHOT_NEUTRAL, new float[]{1f, 1f, 1f});
 
-            float[] forward = ifd.floatArray(TAG_FORWARD_MATRIX_2, null);
-            if (forward == null || forward.length < 9) forward = ifd.floatArray(TAG_FORWARD_MATRIX_1, null);
-            if (forward != null && forward.length >= 9) {
-                cameraToXyz = copyMatrix(forward);
-            } else {
-                float[] color = ifd.floatArray(TAG_COLOR_MATRIX_2, null);
-                if (color == null || color.length < 9) color = ifd.floatArray(TAG_COLOR_MATRIX_1, null);
-                if (color == null || color.length < 9) throw new IOException("DNG has no usable color matrix.");
-                cameraToXyz = invert3x3(copyMatrix(color));
-            }
+            cameraToXyz = cameraToXyz(ifd);
         }
 
         int cfaColor(int x, int y) {
@@ -343,21 +498,27 @@ final class DngDecoder {
             firstIfd = checkedOffset(u32(4));
         }
 
-        RawIfd findRawIfd() throws IOException {
+        Ifd findBestImageIfd() throws IOException {
             List<Ifd> ifds = new ArrayList<>();
             collectIfds(firstIfd, ifds, new HashSet<>(), 0);
             Ifd best = null;
-            long bestPixels = -1;
+            long bestScore = -1;
             for (Ifd ifd : ifds) {
-                if (ifd.intValue(TAG_PHOTOMETRIC, -1) != PHOTOMETRIC_CFA) continue;
+                if (!ifd.entries.containsKey(TAG_WIDTH) || !ifd.entries.containsKey(TAG_HEIGHT)
+                        || !ifd.entries.containsKey(TAG_STRIP_OFFSETS)) continue;
                 long pixels = (long)ifd.intValue(TAG_WIDTH, 0) * ifd.intValue(TAG_HEIGHT, 0);
-                if (pixels > bestPixels) {
+                int photometric = ifd.intValue(TAG_PHOTOMETRIC, -1);
+                boolean cfa = photometric == PHOTOMETRIC_CFA || ifd.entries.containsKey(TAG_CFA_PATTERN);
+                boolean rgb = photometric == PHOTOMETRIC_RGB || photometric == PHOTOMETRIC_LINEAR_RAW;
+                long priority = cfa ? 3L : rgb ? 2L : 1L;
+                long score = priority * 1_000_000_000_000L + pixels;
+                if (score > bestScore) {
                     best = ifd;
-                    bestPixels = pixels;
+                    bestScore = score;
                 }
             }
-            if (best == null) throw new IOException("No Bayer CFA image was found in this DNG.");
-            return new RawIfd(best);
+            if (best == null) throw new IOException("No decodable image strip was found in this DNG.");
+            return best;
         }
 
         private void collectIfds(int offset, List<Ifd> result, Set<Integer> seen, int depth) throws IOException {
