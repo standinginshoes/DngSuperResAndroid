@@ -1,0 +1,3 @@
+src/x3f/x3f_parse_process.lo: src/x3f/x3f_parse_process.cpp \
+ /usr/include/stdc-predef.h
+/usr/include/stdc-predef.h:

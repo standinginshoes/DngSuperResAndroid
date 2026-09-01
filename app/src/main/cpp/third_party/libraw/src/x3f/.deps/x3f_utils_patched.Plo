@@ -1,0 +1,3 @@
+src/x3f/x3f_utils_patched.lo: src/x3f/x3f_utils_patched.cpp \
+ /usr/include/stdc-predef.h
+/usr/include/stdc-predef.h:
