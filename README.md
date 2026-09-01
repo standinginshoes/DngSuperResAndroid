@@ -1,24 +1,38 @@
-# DNG Super Resolution (Android MVP)
+# DNG Super Resolution for Android
 
-An offline Android proof-of-concept that accepts a burst of DNG/image frames, automatically picks a sharp reference frame, estimates translation alignment on grayscale previews, projects the full frames onto a 2× output canvas, incrementally averages them, and exports a lossless PNG.
+An offline Android burst processor that aligns DNG/image frames, rejects poor matches and local motion, merges useful image data, and exports an uncompressed RGB TIFF.
 
-## What v0.1 does
+## Output modes
+
+- **Same size (1×):** strongest practical noise reduction without enlarging the image.
+- **1.5×:** recommended balance between denoising, detail recovery, memory, and processing time.
+- **2×:** maximum output detail when the burst contains useful sub-pixel handheld offsets.
+
+Higher resolution modes do not invent detail with a generative model. They combine differently shifted samples from the burst and interpolate the remaining output grid.
+
+## What v0.2 does
 
 - Android Storage Access Framework multi-select (no broad storage permission)
 - DNG providers with non-image MIME types are supported; bursts are capped at 30 frames
 - DNG/image decode through Android `ImageDecoder`
 - automatic reference selection by Laplacian sharpness score
-- coarse-to-fine gradient-based translational registration, less sensitive to exposure differences
-- robust frame rejection based on post-alignment residuals to reduce blur and ghosting
-- fractional shift refinement using a parabolic fit around the alignment minimum
-- 2× full-resolution projection and sharpness-weighted incremental fusion
+- higher-resolution coarse-to-fine gradient registration with fractional shift refinement
+- per-frame exposure normalization and sharpness/alignment quality weighting
+- whole-frame rejection for badly aligned or highly changed captures
+- robust per-pixel weighting to suppress moving subjects, occlusions, and alignment errors
+- selectable 1×, 1.5×, and 2× full-resolution fusion
 - standards-compliant RGB TIFF export for the fused rendered image
 - fully local/offline processing
-- output size is limited by the device's available memory; allocation failures are reported clearly
+- 70 MP and device-memory safety checks with a clear suggestion to select a lower mode
 
 ## Important limitation
 
-This is the runnable MVP processing path, **not yet true Bayer/CFA RAW super-resolution**. The Pixel DNGs used by this app contain rendered RGB data, so the result is exported as a standards-compliant RGB TIFF. The next engine should use a native DNG/RAW decoder (for example LibRaw) with Bayer DNG input to extract original mosaic samples, preserve black/white levels and CFA metadata, perform local motion/ghost rejection, reconstruct the 2× Bayer plane, demosaic once at the end, and write a high-resolution sensor-raw DNG.
+This is a rendered-image fusion pipeline, **not yet true Bayer/CFA RAW super-resolution**. Android `ImageDecoder` renders each selected DNG before the app receives its pixels, so the current output is an 8-bit RGB TIFF. A future native engine should use a DNG/RAW decoder to extract original mosaic samples, preserve black/white levels and CFA metadata, perform local alignment and motion rejection, reconstruct the Bayer plane, demosaic once at the end, and write a high-bit-depth TIFF or standards-compliant DNG.
+
+The design is informed by Google's published burst photography and handheld multi-frame super-resolution work:
+
+- [Handheld Multi-Frame Super-Resolution](https://research.google/pubs/handheld-multi-frame-super-resolution/)
+- [Burst photography for high dynamic range and low-light imaging on mobile cameras](https://research.google/pubs/burst-photography-for-high-dynamic-range-and-low-light-imaging-on-mobile-cameras/)
 
 ## Build
 
@@ -28,10 +42,9 @@ From a configured command line environment, run `./gradlew assembleDebug` from t
 
 ## Suggested next milestones
 
-1. Native LibRaw DNG ingest via NDK/JNI.
-2. RAW metadata viewer (CFA, black/white level, ISO, exposure, color matrices).
-3. Pyramid + tile/local-motion registration.
-4. Robust outlier/ghost rejection.
-5. CFA-domain 2× fusion with confidence weights.
-6. 16-bit TIFF and standards-compliant DNG writer.
-7. Vulkan/GPU compute path for alignment and reconstruction.
+1. Remove generated desktop build artifacts from the vendored LibRaw tree and wire a minimal Android NDK build.
+2. Native Bayer DNG ingest plus metadata viewer (CFA, black/white level, ISO, exposure, color matrices).
+3. Pyramid and tile-local motion registration for rotation, parallax, and moving subjects.
+4. CFA-domain kernel-regression fusion with confidence weights.
+5. 16-bit TIFF and standards-compliant DNG output.
+6. Vulkan/GPU compute path for alignment and reconstruction.
