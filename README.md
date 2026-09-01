@@ -1,16 +1,25 @@
 # DNG Super Resolution for Android
 
-An offline Android burst processor that aligns DNG/image frames, rejects poor matches and local motion, merges useful image data, and exports an uncompressed RGB TIFF.
+An offline Android burst processor that aligns DNG/image frames, rejects poor matches and local motion, merges useful image data, and exports DNG, TIFF, or JPEG.
 
-## Output modes
+## Output resolution
 
-- **Same size (1×):** strongest practical noise reduction without enlarging the image.
-- **1.5×:** recommended balance between denoising, detail recovery, memory, and processing time.
-- **2×:** maximum output detail when the burst contains useful sub-pixel handheld offsets.
+- **100% (1×) is the default:** strongest practical noise reduction without enlarging the image.
+- **Variable 100–200% sizing:** choose any output scale in 5% steps.
+- **150%:** a useful balance between denoising, detail recovery, memory, and processing time.
+- **200%:** maximum output detail when the burst contains useful sub-pixel handheld offsets.
 
 Higher resolution modes do not invent detail with a generative model. They combine differently shifted samples from the burst and interpolate the remaining output grid.
 
-## What v0.5 does
+## Output formats
+
+- **DNG:** uncompressed 16-bit LinearRaw containing the rendered merged RGB result.
+- **TIFF:** uncompressed 8-bit RGB.
+- **JPEG:** high-quality (95) compressed RGB for smaller files.
+
+The DNG output is a standards-based LinearRaw DNG, not the original Bayer sensor mosaic. The merge currently works on rendered RGB frames, so exporting to 16-bit DNG preserves a lossless linear container but cannot recreate sensor precision that was discarded during 8-bit rendering.
+
+## What v0.6 does
 
 - Android Storage Access Framework multi-select (no broad storage permission)
 - DNG providers with non-image MIME types are supported; bursts are capped at 30 frames
@@ -26,14 +35,14 @@ Higher resolution modes do not invent detail with a generative model. They combi
 - per-frame exposure normalization and sharpness/alignment quality weighting
 - whole-frame rejection for badly aligned or highly changed captures
 - robust per-pixel weighting to suppress moving subjects, occlusions, and alignment errors
-- selectable 1×, 1.5×, and 2× full-resolution fusion
-- standards-compliant RGB TIFF export for the fused rendered image
+- variable 100–200% full-resolution fusion in 5% steps
+- selectable 16-bit LinearRaw DNG, uncompressed RGB TIFF, or high-quality JPEG export
 - fully local/offline processing
 - 70 MP and device-memory safety checks with a clear suggestion to select a lower mode
 
 ## Important limitation
 
-The app now reads uncompressed Bayer DNG input directly, but it currently demosaics every frame before alignment and fusion. The output is therefore an 8-bit RGB TIFF, not a new sensor-raw DNG. A future engine should align and merge the original CFA samples, demosaic only once after fusion, and write a high-bit-depth TIFF or standards-compliant DNG. Compressed DNG variants are not yet supported by the built-in decoder.
+The app reads uncompressed Bayer DNG input directly, but it currently demosaics every frame before alignment and fusion. Its DNG export is therefore 16-bit LinearRaw RGB, not a new sensor-raw Bayer DNG. A future engine should align and merge the original CFA samples and demosaic only once after fusion. Compressed DNG variants are not yet supported by the built-in decoder.
 
 The design is informed by Google's published burst photography and handheld multi-frame super-resolution work:
 

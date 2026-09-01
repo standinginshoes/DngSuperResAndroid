@@ -18,11 +18,13 @@ import android.widget.ArrayAdapter;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.SeekBar;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.BufferedOutputStream;
 import java.io.OutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -43,12 +45,8 @@ public class MainActivity extends Activity {
     private static final int PIXEL_GHOST_THRESHOLD = 14;
     private static final int FUSION_TILE_HEIGHT = 256;
     private static final long MAX_OUTPUT_PIXELS = 70_000_000L;
-    private static final String[] OUTPUT_LABELS = {
-            "Same size (1×) — best noise reduction",
-            "1.5× — recommended balance",
-            "2× — maximum detail"
-    };
-    private static final float[] OUTPUT_SCALES = {1f, 1.5f, 2f};
+    private static final int OUTPUT_SCALE_STEPS = 20;
+    private static final float OUTPUT_SCALE_STEP = 0.05f;
 
     private final ArrayList<Uri> frames = new ArrayList<>();
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -63,9 +61,13 @@ public class MainActivity extends Activity {
     private Button cancelButton;
     private Button saveButton;
     private Button selectButton;
-    private Spinner resolutionSpinner;
+    private SeekBar resolutionSeekBar;
+    private TextView resolutionValue;
+    private Spinner formatSpinner;
     private float selectedOutputScale = 1f;
     private float resultOutputScale = 1f;
+    private OutputFormat selectedOutputFormat = OutputFormat.TIFF;
+    private OutputFormat pendingSaveFormat = OutputFormat.TIFF;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -87,7 +89,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Offline multi-frame denoise + super resolution • v0.5");
+        subtitle.setText("Offline multi-frame denoise + super resolution • v0.6");
         subtitle.setTextSize(15);
         subtitle.setTextColor(Color.DKGRAY);
         subtitle.setPadding(0, 0, 0, dp(18));
@@ -105,33 +107,74 @@ public class MainActivity extends Activity {
         resolutionLabel.setPadding(0, dp(14), 0, dp(4));
         root.addView(resolutionLabel);
 
-        resolutionSpinner = new Spinner(this);
-        ArrayAdapter<String> resolutionAdapter = new ArrayAdapter<>(this,
-                android.R.layout.simple_spinner_item, OUTPUT_LABELS);
-        resolutionAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        resolutionSpinner.setAdapter(resolutionAdapter);
-        resolutionSpinner.setSelection(0);
-        resolutionSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+        resolutionValue = new TextView(this);
+        resolutionValue.setTextSize(18);
+        resolutionValue.setTextColor(Color.rgb(35, 35, 35));
+        root.addView(resolutionValue, matchWrap());
+
+        resolutionSeekBar = new SeekBar(this);
+        resolutionSeekBar.setMax(OUTPUT_SCALE_STEPS);
+        resolutionSeekBar.setProgress(0);
+        resolutionSeekBar.setContentDescription("Output size from 100 to 200 percent");
+        resolutionSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
-            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
-                selectedOutputScale = OUTPUT_SCALES[position];
+            public void onProgressChanged(SeekBar seekBar, int progressValue, boolean fromUser) {
+                selectedOutputScale = 1f + progressValue * OUTPUT_SCALE_STEP;
                 updateProcessButtonLabel();
             }
 
             @Override
-            public void onNothingSelected(android.widget.AdapterView<?> parent) { }
+            public void onStartTrackingTouch(SeekBar seekBar) { }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) { }
         });
-        root.addView(resolutionSpinner, matchWrap());
+        root.addView(resolutionSeekBar, matchWrap());
+        updateProcessButtonLabel();
 
         TextView resolutionHint = new TextView(this);
-        resolutionHint.setText("1× merges aligned frames at the original dimensions. Higher modes use sub-pixel burst offsets to recover additional detail.");
+        resolutionHint.setText("Choose any size from 100% to 200% in 5% steps. 100% keeps the original dimensions; larger sizes use sub-pixel burst offsets to recover detail.");
         resolutionHint.setTextSize(13);
         resolutionHint.setTextColor(Color.DKGRAY);
         resolutionHint.setPadding(0, dp(4), 0, dp(10));
         root.addView(resolutionHint);
 
+        TextView formatLabel = new TextView(this);
+        formatLabel.setText("Output format");
+        formatLabel.setTextSize(16);
+        formatLabel.setTextColor(Color.rgb(35, 35, 35));
+        formatLabel.setPadding(0, dp(6), 0, dp(4));
+        root.addView(formatLabel);
+
+        formatSpinner = new Spinner(this);
+        String[] formatLabels = new String[OutputFormat.values().length];
+        for (int i = 0; i < formatLabels.length; i++) formatLabels[i] = OutputFormat.values()[i].label;
+        ArrayAdapter<String> formatAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, formatLabels);
+        formatAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        formatSpinner.setAdapter(formatAdapter);
+        formatSpinner.setSelection(0);
+        formatSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                selectedOutputFormat = OutputFormat.values()[position];
+                updateSaveButtonLabel();
+            }
+
+            @Override
+            public void onNothingSelected(android.widget.AdapterView<?> parent) { }
+        });
+        root.addView(formatSpinner, matchWrap());
+
+        TextView formatHint = new TextView(this);
+        formatHint.setText("DNG is lossless 16-bit LinearRaw, TIFF is lossless RGB, and JPEG is a smaller high-quality file.");
+        formatHint.setTextSize(13);
+        formatHint.setTextColor(Color.DKGRAY);
+        formatHint.setPadding(0, dp(4), 0, dp(10));
+        root.addView(formatHint);
+
         processButton = new Button(this);
-        processButton.setText("Merge at 1×");
+        processButton.setText("Merge at " + scaleLabel(selectedOutputScale));
         processButton.setEnabled(false);
         processButton.setOnClickListener(v -> startProcessing());
         root.addView(processButton, matchWrap());
@@ -180,11 +223,23 @@ public class MainActivity extends Activity {
     }
 
     private void updateProcessButtonLabel() {
-        if (processButton != null) processButton.setText("Merge at " + scaleLabel(selectedOutputScale));
+        String label = scaleLabel(selectedOutputScale);
+        if (resolutionValue != null) resolutionValue.setText("Output size: " + label);
+        if (processButton != null) processButton.setText("Merge at " + label);
     }
 
     private String scaleLabel(float scale) {
-        return scale == 1f ? "1×" : scale == 1.5f ? "1.5×" : "2×";
+        int percent = Math.round(scale * 100f);
+        String multiplier = percent % 100 == 0
+                ? Integer.toString(percent / 100)
+                : percent % 10 == 0
+                    ? String.format(java.util.Locale.US, "%.1f", percent / 100f)
+                    : String.format(java.util.Locale.US, "%.2f", percent / 100f);
+        return percent + "% (" + multiplier + "×)";
+    }
+
+    private void updateSaveButtonLabel() {
+        if (saveButton != null) saveButton.setText("Save " + selectedOutputFormat.shortLabel);
     }
 
     private LinearLayout.LayoutParams matchWrap() {
@@ -248,7 +303,8 @@ public class MainActivity extends Activity {
         previewImage.setImageDrawable(null);
         processButton.setEnabled(false);
         selectButton.setEnabled(false);
-        resolutionSpinner.setEnabled(false);
+        resolutionSeekBar.setEnabled(false);
+        formatSpinner.setEnabled(false);
         cancelButton.setEnabled(true);
         saveButton.setEnabled(false);
         progress.setProgress(0);
@@ -383,7 +439,8 @@ public class MainActivity extends Activity {
                     previewImage.setImageBitmap(resultPreview);
                     processButton.setEnabled(true);
                     selectButton.setEnabled(true);
-                    resolutionSpinner.setEnabled(true);
+                    resolutionSeekBar.setEnabled(true);
+                    formatSpinner.setEnabled(true);
                     cancelButton.setEnabled(false);
                     saveButton.setEnabled(true);
                 });
@@ -393,7 +450,8 @@ public class MainActivity extends Activity {
                     status.setText(t instanceof ProcessingCancelledException ? "Processing cancelled" : "Processing failed: " + errorMessage);
                     processButton.setEnabled(true);
                     selectButton.setEnabled(true);
-                    resolutionSpinner.setEnabled(true);
+                    resolutionSeekBar.setEnabled(true);
+                    formatSpinner.setEnabled(true);
                     cancelButton.setEnabled(false);
                     saveButton.setEnabled(false);
                     if (!(t instanceof ProcessingCancelledException)) {
@@ -685,45 +743,59 @@ public class MainActivity extends Activity {
 
     private void chooseSaveLocation() {
         if (resultBitmap == null) return;
+        pendingSaveFormat = selectedOutputFormat;
         Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
-        i.setType("image/tiff");
-        i.putExtra(Intent.EXTRA_TITLE, outputFileName());
+        i.setType(pendingSaveFormat.mimeType);
+        i.putExtra(Intent.EXTRA_TITLE, outputFileName(pendingSaveFormat));
         startActivityForResult(i, SAVE_RESULT);
     }
 
-    private String outputFileName() {
-        String scale = resultOutputScale == 1f ? "1x" : resultOutputScale == 1.5f ? "1_5x" : "2x";
-        return "SuperRes_" + scale + ".tif";
+    private String outputFileName(OutputFormat format) {
+        int percent = Math.round(resultOutputScale * 100f);
+        return "SuperRes_" + percent + "pct." + format.extension;
     }
 
     private void saveResult(Uri uri) {
         if (resultBitmap == null) return;
         Bitmap bitmapToSave = resultBitmap;
-        String fileName = outputFileName();
+        OutputFormat format = pendingSaveFormat;
+        String fileName = outputFileName(format);
         selectButton.setEnabled(false);
         processButton.setEnabled(false);
-        resolutionSpinner.setEnabled(false);
+        resolutionSeekBar.setEnabled(false);
+        formatSpinner.setEnabled(false);
         saveButton.setEnabled(false);
         status.setText("Saving " + fileName + "…");
         executor.execute(() -> {
-            try (OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
-                if (out == null) throw new IllegalStateException("Could not open output file.");
-                writeTiff(out, bitmapToSave);
+            try (OutputStream raw = getContentResolver().openOutputStream(uri, "w")) {
+                if (raw == null) throw new IllegalStateException("Could not open output file.");
+                try (BufferedOutputStream out = new BufferedOutputStream(raw, 64 * 1024)) {
+                    if (format == OutputFormat.DNG) {
+                        DngWriter.write(out, bitmapToSave);
+                    } else if (format == OutputFormat.JPEG) {
+                        if (!bitmapToSave.compress(Bitmap.CompressFormat.JPEG, 95, out)) {
+                            throw new IOException("Android could not encode the JPEG.");
+                        }
+                    } else {
+                        writeTiff(out, bitmapToSave);
+                    }
+                }
                 runOnUiThread(() -> {
                     status.setText("Saved " + fileName);
                     Toast.makeText(this, "Saved " + fileName, Toast.LENGTH_LONG).show();
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
-                    status.setText("TIFF save failed: " + e.getMessage());
-                    Toast.makeText(this, "TIFF save failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    status.setText(format.shortLabel + " save failed: " + e.getMessage());
+                    Toast.makeText(this, format.shortLabel + " save failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
                 });
             } finally {
                 runOnUiThread(() -> {
                     selectButton.setEnabled(true);
                     processButton.setEnabled(frames.size() >= 2);
-                    resolutionSpinner.setEnabled(true);
+                    resolutionSeekBar.setEnabled(true);
+                    formatSpinner.setEnabled(true);
                     saveButton.setEnabled(resultBitmap != null);
                 });
             }
@@ -874,6 +946,24 @@ public class MainActivity extends Activity {
         double exposureScale = 1.0;
         FrameInfo(Uri uri, Bitmap preview, double sharpness) {
             this.uri = uri; this.preview = preview; this.sharpness = sharpness;
+        }
+    }
+
+    private enum OutputFormat {
+        TIFF("TIFF — lossless RGB", "TIFF", "image/tiff", "tif"),
+        DNG("DNG — lossless 16-bit LinearRaw", "DNG", "image/x-adobe-dng", "dng"),
+        JPEG("JPEG — high quality, smaller file", "JPEG", "image/jpeg", "jpg");
+
+        final String label;
+        final String shortLabel;
+        final String mimeType;
+        final String extension;
+
+        OutputFormat(String label, String shortLabel, String mimeType, String extension) {
+            this.label = label;
+            this.shortLabel = shortLabel;
+            this.mimeType = mimeType;
+            this.extension = extension;
         }
     }
 

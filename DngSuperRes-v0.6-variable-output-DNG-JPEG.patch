@@ -1,0 +1,551 @@
+diff --git a/README.md b/README.md
+index 7b46ec0..9eca0c1 100644
+--- a/README.md
++++ b/README.md
+@@ -1,16 +1,25 @@
+ # DNG Super Resolution for Android
+ 
+-An offline Android burst processor that aligns DNG/image frames, rejects poor matches and local motion, merges useful image data, and exports an uncompressed RGB TIFF.
++An offline Android burst processor that aligns DNG/image frames, rejects poor matches and local motion, merges useful image data, and exports DNG, TIFF, or JPEG.
+ 
+-## Output modes
++## Output resolution
+ 
+-- **Same size (1×):** strongest practical noise reduction without enlarging the image.
+-- **1.5×:** recommended balance between denoising, detail recovery, memory, and processing time.
+-- **2×:** maximum output detail when the burst contains useful sub-pixel handheld offsets.
++- **100% (1×) is the default:** strongest practical noise reduction without enlarging the image.
++- **Variable 100–200% sizing:** choose any output scale in 5% steps.
++- **150%:** a useful balance between denoising, detail recovery, memory, and processing time.
++- **200%:** maximum output detail when the burst contains useful sub-pixel handheld offsets.
+ 
+ Higher resolution modes do not invent detail with a generative model. They combine differently shifted samples from the burst and interpolate the remaining output grid.
+ 
+-## What v0.5 does
++## Output formats
++
++- **DNG:** uncompressed 16-bit LinearRaw containing the rendered merged RGB result.
++- **TIFF:** uncompressed 8-bit RGB.
++- **JPEG:** high-quality (95) compressed RGB for smaller files.
++
++The DNG output is a standards-based LinearRaw DNG, not the original Bayer sensor mosaic. The merge currently works on rendered RGB frames, so exporting to 16-bit DNG preserves a lossless linear container but cannot recreate sensor precision that was discarded during 8-bit rendering.
++
++## What v0.6 does
+ 
+ - Android Storage Access Framework multi-select (no broad storage permission)
+ - DNG providers with non-image MIME types are supported; bursts are capped at 30 frames
+@@ -26,14 +35,14 @@ Higher resolution modes do not invent detail with a generative model. They combi
+ - per-frame exposure normalization and sharpness/alignment quality weighting
+ - whole-frame rejection for badly aligned or highly changed captures
+ - robust per-pixel weighting to suppress moving subjects, occlusions, and alignment errors
+-- selectable 1×, 1.5×, and 2× full-resolution fusion
+-- standards-compliant RGB TIFF export for the fused rendered image
++- variable 100–200% full-resolution fusion in 5% steps
++- selectable 16-bit LinearRaw DNG, uncompressed RGB TIFF, or high-quality JPEG export
+ - fully local/offline processing
+ - 70 MP and device-memory safety checks with a clear suggestion to select a lower mode
+ 
+ ## Important limitation
+ 
+-The app now reads uncompressed Bayer DNG input directly, but it currently demosaics every frame before alignment and fusion. The output is therefore an 8-bit RGB TIFF, not a new sensor-raw DNG. A future engine should align and merge the original CFA samples, demosaic only once after fusion, and write a high-bit-depth TIFF or standards-compliant DNG. Compressed DNG variants are not yet supported by the built-in decoder.
++The app reads uncompressed Bayer DNG input directly, but it currently demosaics every frame before alignment and fusion. Its DNG export is therefore 16-bit LinearRaw RGB, not a new sensor-raw Bayer DNG. A future engine should align and merge the original CFA samples and demosaic only once after fusion. Compressed DNG variants are not yet supported by the built-in decoder.
+ 
+ The design is informed by Google's published burst photography and handheld multi-frame super-resolution work:
+ 
+diff --git a/app/build.gradle b/app/build.gradle
+index 41f56b4..937a65b 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -10,7 +10,7 @@ android {
+         applicationId 'com.openai.dngsuperres'
+         minSdk 28
+         targetSdk 35
+-        versionCode 5
+-        versionName '0.5.0'
++        versionCode 6
++        versionName '0.6.0'
+     }
+ }
+diff --git a/app/src/main/java/com/openai/dngsuperres/DngWriter.java b/app/src/main/java/com/openai/dngsuperres/DngWriter.java
+new file mode 100644
+index 0000000..f70ab16
+--- /dev/null
++++ b/app/src/main/java/com/openai/dngsuperres/DngWriter.java
+@@ -0,0 +1,178 @@
++package com.openai.dngsuperres;
++
++import android.graphics.Bitmap;
++import android.graphics.Color;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.nio.charset.StandardCharsets;
++
++/** Writes the rendered merge as an uncompressed 16-bit LinearRaw DNG. */
++final class DngWriter {
++    private static final int TYPE_BYTE = 1;
++    private static final int TYPE_ASCII = 2;
++    private static final int TYPE_SHORT = 3;
++    private static final int TYPE_LONG = 4;
++    private static final int TYPE_RATIONAL = 5;
++    private static final int TYPE_SRATIONAL = 10;
++    private static final int ENTRY_COUNT = 22;
++    private static final int[] SRGB_TO_LINEAR_16 = buildSrgbToLinearTable();
++
++    private DngWriter() { }
++
++    static void write(OutputStream out, Bitmap bitmap) throws IOException {
++        int width = bitmap.getWidth();
++        int height = bitmap.getHeight();
++        long pixelBytes = (long)width * height * 6L;
++        if (pixelBytes > 0xffffffffL) {
++            throw new IOException("DNG output is too large for a classic TIFF/DNG container.");
++        }
++
++        byte[] make = ascii("DngSuperRes");
++        byte[] model = ascii("Merged RGB burst");
++        byte[] software = ascii("DngSuperRes Android 0.6");
++        byte[] uniqueModel = ascii("DngSuperRes LinearRaw");
++
++        int ifdEnd = 8 + 2 + ENTRY_COUNT * 12 + 4;
++        ByteArrayOutputStream metadata = new ByteArrayOutputStream(160);
++
++        int bitsOffset = appendShorts(metadata, ifdEnd, 16, 16, 16);
++        int sampleFormatOffset = appendShorts(metadata, ifdEnd, 1, 1, 1);
++        int makeOffset = appendBytes(metadata, ifdEnd, make);
++        int modelOffset = appendBytes(metadata, ifdEnd, model);
++        int softwareOffset = appendBytes(metadata, ifdEnd, software);
++        int uniqueModelOffset = appendBytes(metadata, ifdEnd, uniqueModel);
++
++        // D65 XYZ-to-linear-sRGB matrix. LinearRaw pixels use these RGB primaries.
++        int colorMatrixOffset = ifdEnd + metadata.size();
++        int[] matrix = {
++                3240454, -1537139, -498531,
++                -969266, 1876011, 41556,
++                55643, -204026, 1057225
++        };
++        for (int value : matrix) {
++            putInt(metadata, value);
++            putInt(metadata, 1_000_000);
++        }
++        int neutralOffset = ifdEnd + metadata.size();
++        for (int i = 0; i < 3; i++) {
++            putInt(metadata, 1);
++            putInt(metadata, 1);
++        }
++        padEven(metadata);
++        int pixelOffset = ifdEnd + metadata.size();
++
++        putShort(out, 'I' | ('I' << 8));
++        putShort(out, 42);
++        putInt(out, 8);
++        putShort(out, ENTRY_COUNT);
++        entry(out, 254, TYPE_LONG, 1, 0);                  // NewSubfileType
++        entry(out, 256, TYPE_LONG, 1, width);              // ImageWidth
++        entry(out, 257, TYPE_LONG, 1, height);             // ImageLength
++        entry(out, 258, TYPE_SHORT, 3, bitsOffset);        // BitsPerSample
++        entry(out, 259, TYPE_SHORT, 1, 1);                 // Compression: none
++        entry(out, 262, TYPE_SHORT, 1, 34892);             // LinearRaw
++        entry(out, 271, TYPE_ASCII, make.length, makeOffset);
++        entry(out, 272, TYPE_ASCII, model.length, modelOffset);
++        entry(out, 273, TYPE_LONG, 1, pixelOffset);        // StripOffsets
++        entry(out, 274, TYPE_SHORT, 1, 1);                 // Orientation
++        entry(out, 277, TYPE_SHORT, 1, 3);                 // SamplesPerPixel
++        entry(out, 278, TYPE_LONG, 1, height);             // RowsPerStrip
++        entry(out, 279, TYPE_LONG, 1, pixelBytes);         // StripByteCounts
++        entry(out, 284, TYPE_SHORT, 1, 1);                 // Chunky RGB
++        entry(out, 305, TYPE_ASCII, software.length, softwareOffset);
++        entry(out, 339, TYPE_SHORT, 3, sampleFormatOffset);
++        entry(out, 50706, TYPE_BYTE, 4, 1 | (6 << 8));     // DNGVersion 1.6.0.0
++        entry(out, 50707, TYPE_BYTE, 4, 1 | (4 << 8));     // DNGBackwardVersion 1.4.0.0
++        entry(out, 50708, TYPE_ASCII, uniqueModel.length, uniqueModelOffset);
++        entry(out, 50721, TYPE_SRATIONAL, 9, colorMatrixOffset);
++        entry(out, 50728, TYPE_RATIONAL, 3, neutralOffset); // AsShotNeutral
++        entry(out, 50778, TYPE_SHORT, 1, 21);               // D65
++        // LinearRaw defaults are black=0 and white=65535.
++        putInt(out, 0);
++        out.write(metadata.toByteArray());
++
++        int[] pixels = new int[width];
++        byte[] row = new byte[width * 6];
++        for (int y = 0; y < height; y++) {
++            bitmap.getPixels(pixels, 0, width, 0, y, width, 1);
++            for (int x = 0; x < width; x++) {
++                int color = pixels[x];
++                int index = x * 6;
++                putU16(row, index, SRGB_TO_LINEAR_16[Color.red(color)]);
++                putU16(row, index + 2, SRGB_TO_LINEAR_16[Color.green(color)]);
++                putU16(row, index + 4, SRGB_TO_LINEAR_16[Color.blue(color)]);
++            }
++            out.write(row);
++        }
++    }
++
++    private static int appendShorts(ByteArrayOutputStream out, int baseOffset, int... values)
++            throws IOException {
++        int offset = baseOffset + out.size();
++        for (int value : values) putShort(out, value);
++        padEven(out);
++        return offset;
++    }
++
++    private static int appendBytes(ByteArrayOutputStream out, int baseOffset, byte[] values) {
++        int offset = baseOffset + out.size();
++        out.write(values, 0, values.length);
++        padEven(out);
++        return offset;
++    }
++
++    private static void padEven(ByteArrayOutputStream out) {
++        if ((out.size() & 1) != 0) out.write(0);
++    }
++
++    private static byte[] ascii(String value) {
++        byte[] text = value.getBytes(StandardCharsets.US_ASCII);
++        byte[] terminated = new byte[text.length + 1];
++        System.arraycopy(text, 0, terminated, 0, text.length);
++        return terminated;
++    }
++
++    private static void entry(OutputStream out, int tag, int type, int count, long value)
++            throws IOException {
++        putShort(out, tag);
++        putShort(out, type);
++        putInt(out, count);
++        if (type == TYPE_SHORT && count == 1) {
++            putShort(out, (int)value);
++            putShort(out, 0);
++        } else {
++            putInt(out, value);
++        }
++    }
++
++    private static void putU16(byte[] target, int offset, int value) {
++        target[offset] = (byte)(value & 255);
++        target[offset + 1] = (byte)((value >>> 8) & 255);
++    }
++
++    private static void putShort(OutputStream out, int value) throws IOException {
++        out.write(value & 255);
++        out.write((value >>> 8) & 255);
++    }
++
++    private static void putInt(OutputStream out, long value) throws IOException {
++        out.write((int)value & 255);
++        out.write(((int)value >>> 8) & 255);
++        out.write(((int)value >>> 16) & 255);
++        out.write(((int)value >>> 24) & 255);
++    }
++
++    private static int[] buildSrgbToLinearTable() {
++        int[] table = new int[256];
++        for (int i = 0; i < table.length; i++) {
++            double encoded = i / 255.0;
++            double linear = encoded <= 0.04045
++                    ? encoded / 12.92
++                    : Math.pow((encoded + 0.055) / 1.055, 2.4);
++            table[i] = (int)Math.round(linear * 65535.0);
++        }
++        return table;
++    }
++}
+diff --git a/app/src/main/java/com/openai/dngsuperres/MainActivity.java b/app/src/main/java/com/openai/dngsuperres/MainActivity.java
+index 917af59..a0a4af1 100644
+--- a/app/src/main/java/com/openai/dngsuperres/MainActivity.java
++++ b/app/src/main/java/com/openai/dngsuperres/MainActivity.java
+@@ -18,11 +18,13 @@ import android.widget.ArrayAdapter;
+ import android.widget.ImageView;
+ import android.widget.LinearLayout;
+ import android.widget.ProgressBar;
++import android.widget.SeekBar;
+ import android.widget.ScrollView;
+ import android.widget.Spinner;
+ import android.widget.TextView;
+ import android.widget.Toast;
+ 
++import java.io.BufferedOutputStream;
+ import java.io.OutputStream;
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -43,12 +45,8 @@ public class MainActivity extends Activity {
+     private static final int PIXEL_GHOST_THRESHOLD = 14;
+     private static final int FUSION_TILE_HEIGHT = 256;
+     private static final long MAX_OUTPUT_PIXELS = 70_000_000L;
+-    private static final String[] OUTPUT_LABELS = {
+-            "Same size (1×) — best noise reduction",
+-            "1.5× — recommended balance",
+-            "2× — maximum detail"
+-    };
+-    private static final float[] OUTPUT_SCALES = {1f, 1.5f, 2f};
++    private static final int OUTPUT_SCALE_STEPS = 20;
++    private static final float OUTPUT_SCALE_STEP = 0.05f;
+ 
+     private final ArrayList<Uri> frames = new ArrayList<>();
+     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+@@ -63,9 +61,13 @@ public class MainActivity extends Activity {
+     private Button cancelButton;
+     private Button saveButton;
+     private Button selectButton;
+-    private Spinner resolutionSpinner;
++    private SeekBar resolutionSeekBar;
++    private TextView resolutionValue;
++    private Spinner formatSpinner;
+     private float selectedOutputScale = 1f;
+     private float resultOutputScale = 1f;
++    private OutputFormat selectedOutputFormat = OutputFormat.TIFF;
++    private OutputFormat pendingSaveFormat = OutputFormat.TIFF;
+ 
+     @Override
+     protected void onCreate(Bundle savedInstanceState) {
+@@ -87,7 +89,7 @@ public class MainActivity extends Activity {
+         root.addView(title);
+ 
+         TextView subtitle = new TextView(this);
+-        subtitle.setText("Offline multi-frame denoise + super resolution • v0.5");
++        subtitle.setText("Offline multi-frame denoise + super resolution • v0.6");
+         subtitle.setTextSize(15);
+         subtitle.setTextColor(Color.DKGRAY);
+         subtitle.setPadding(0, 0, 0, dp(18));
+@@ -105,33 +107,74 @@ public class MainActivity extends Activity {
+         resolutionLabel.setPadding(0, dp(14), 0, dp(4));
+         root.addView(resolutionLabel);
+ 
+-        resolutionSpinner = new Spinner(this);
+-        ArrayAdapter<String> resolutionAdapter = new ArrayAdapter<>(this,
+-                android.R.layout.simple_spinner_item, OUTPUT_LABELS);
+-        resolutionAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+-        resolutionSpinner.setAdapter(resolutionAdapter);
+-        resolutionSpinner.setSelection(0);
+-        resolutionSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
++        resolutionValue = new TextView(this);
++        resolutionValue.setTextSize(18);
++        resolutionValue.setTextColor(Color.rgb(35, 35, 35));
++        root.addView(resolutionValue, matchWrap());
++
++        resolutionSeekBar = new SeekBar(this);
++        resolutionSeekBar.setMax(OUTPUT_SCALE_STEPS);
++        resolutionSeekBar.setProgress(0);
++        resolutionSeekBar.setContentDescription("Output size from 100 to 200 percent");
++        resolutionSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+             @Override
+-            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+-                selectedOutputScale = OUTPUT_SCALES[position];
++            public void onProgressChanged(SeekBar seekBar, int progressValue, boolean fromUser) {
++                selectedOutputScale = 1f + progressValue * OUTPUT_SCALE_STEP;
+                 updateProcessButtonLabel();
+             }
+ 
+             @Override
+-            public void onNothingSelected(android.widget.AdapterView<?> parent) { }
++            public void onStartTrackingTouch(SeekBar seekBar) { }
++
++            @Override
++            public void onStopTrackingTouch(SeekBar seekBar) { }
+         });
+-        root.addView(resolutionSpinner, matchWrap());
++        root.addView(resolutionSeekBar, matchWrap());
++        updateProcessButtonLabel();
+ 
+         TextView resolutionHint = new TextView(this);
+-        resolutionHint.setText("1× merges aligned frames at the original dimensions. Higher modes use sub-pixel burst offsets to recover additional detail.");
++        resolutionHint.setText("Choose any size from 100% to 200% in 5% steps. 100% keeps the original dimensions; larger sizes use sub-pixel burst offsets to recover detail.");
+         resolutionHint.setTextSize(13);
+         resolutionHint.setTextColor(Color.DKGRAY);
+         resolutionHint.setPadding(0, dp(4), 0, dp(10));
+         root.addView(resolutionHint);
+ 
++        TextView formatLabel = new TextView(this);
++        formatLabel.setText("Output format");
++        formatLabel.setTextSize(16);
++        formatLabel.setTextColor(Color.rgb(35, 35, 35));
++        formatLabel.setPadding(0, dp(6), 0, dp(4));
++        root.addView(formatLabel);
++
++        formatSpinner = new Spinner(this);
++        String[] formatLabels = new String[OutputFormat.values().length];
++        for (int i = 0; i < formatLabels.length; i++) formatLabels[i] = OutputFormat.values()[i].label;
++        ArrayAdapter<String> formatAdapter = new ArrayAdapter<>(this,
++                android.R.layout.simple_spinner_item, formatLabels);
++        formatAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
++        formatSpinner.setAdapter(formatAdapter);
++        formatSpinner.setSelection(0);
++        formatSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
++            @Override
++            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
++                selectedOutputFormat = OutputFormat.values()[position];
++                updateSaveButtonLabel();
++            }
++
++            @Override
++            public void onNothingSelected(android.widget.AdapterView<?> parent) { }
++        });
++        root.addView(formatSpinner, matchWrap());
++
++        TextView formatHint = new TextView(this);
++        formatHint.setText("DNG is lossless 16-bit LinearRaw, TIFF is lossless RGB, and JPEG is a smaller high-quality file.");
++        formatHint.setTextSize(13);
++        formatHint.setTextColor(Color.DKGRAY);
++        formatHint.setPadding(0, dp(4), 0, dp(10));
++        root.addView(formatHint);
++
+         processButton = new Button(this);
+-        processButton.setText("Merge at 1×");
++        processButton.setText("Merge at " + scaleLabel(selectedOutputScale));
+         processButton.setEnabled(false);
+         processButton.setOnClickListener(v -> startProcessing());
+         root.addView(processButton, matchWrap());
+@@ -180,11 +223,23 @@ public class MainActivity extends Activity {
+     }
+ 
+     private void updateProcessButtonLabel() {
+-        if (processButton != null) processButton.setText("Merge at " + scaleLabel(selectedOutputScale));
++        String label = scaleLabel(selectedOutputScale);
++        if (resolutionValue != null) resolutionValue.setText("Output size: " + label);
++        if (processButton != null) processButton.setText("Merge at " + label);
+     }
+ 
+     private String scaleLabel(float scale) {
+-        return scale == 1f ? "1×" : scale == 1.5f ? "1.5×" : "2×";
++        int percent = Math.round(scale * 100f);
++        String multiplier = percent % 100 == 0
++                ? Integer.toString(percent / 100)
++                : percent % 10 == 0
++                    ? String.format(java.util.Locale.US, "%.1f", percent / 100f)
++                    : String.format(java.util.Locale.US, "%.2f", percent / 100f);
++        return percent + "% (" + multiplier + "×)";
++    }
++
++    private void updateSaveButtonLabel() {
++        if (saveButton != null) saveButton.setText("Save " + selectedOutputFormat.shortLabel);
+     }
+ 
+     private LinearLayout.LayoutParams matchWrap() {
+@@ -248,7 +303,8 @@ public class MainActivity extends Activity {
+         previewImage.setImageDrawable(null);
+         processButton.setEnabled(false);
+         selectButton.setEnabled(false);
+-        resolutionSpinner.setEnabled(false);
++        resolutionSeekBar.setEnabled(false);
++        formatSpinner.setEnabled(false);
+         cancelButton.setEnabled(true);
+         saveButton.setEnabled(false);
+         progress.setProgress(0);
+@@ -383,7 +439,8 @@ public class MainActivity extends Activity {
+                     previewImage.setImageBitmap(resultPreview);
+                     processButton.setEnabled(true);
+                     selectButton.setEnabled(true);
+-                    resolutionSpinner.setEnabled(true);
++                    resolutionSeekBar.setEnabled(true);
++                    formatSpinner.setEnabled(true);
+                     cancelButton.setEnabled(false);
+                     saveButton.setEnabled(true);
+                 });
+@@ -393,7 +450,8 @@ public class MainActivity extends Activity {
+                     status.setText(t instanceof ProcessingCancelledException ? "Processing cancelled" : "Processing failed: " + errorMessage);
+                     processButton.setEnabled(true);
+                     selectButton.setEnabled(true);
+-                    resolutionSpinner.setEnabled(true);
++                    resolutionSeekBar.setEnabled(true);
++                    formatSpinner.setEnabled(true);
+                     cancelButton.setEnabled(false);
+                     saveButton.setEnabled(false);
+                     if (!(t instanceof ProcessingCancelledException)) {
+@@ -685,45 +743,59 @@ public class MainActivity extends Activity {
+ 
+     private void chooseSaveLocation() {
+         if (resultBitmap == null) return;
++        pendingSaveFormat = selectedOutputFormat;
+         Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+         i.addCategory(Intent.CATEGORY_OPENABLE);
+-        i.setType("image/tiff");
+-        i.putExtra(Intent.EXTRA_TITLE, outputFileName());
++        i.setType(pendingSaveFormat.mimeType);
++        i.putExtra(Intent.EXTRA_TITLE, outputFileName(pendingSaveFormat));
+         startActivityForResult(i, SAVE_RESULT);
+     }
+ 
+-    private String outputFileName() {
+-        String scale = resultOutputScale == 1f ? "1x" : resultOutputScale == 1.5f ? "1_5x" : "2x";
+-        return "SuperRes_" + scale + ".tif";
++    private String outputFileName(OutputFormat format) {
++        int percent = Math.round(resultOutputScale * 100f);
++        return "SuperRes_" + percent + "pct." + format.extension;
+     }
+ 
+     private void saveResult(Uri uri) {
+         if (resultBitmap == null) return;
+         Bitmap bitmapToSave = resultBitmap;
+-        String fileName = outputFileName();
++        OutputFormat format = pendingSaveFormat;
++        String fileName = outputFileName(format);
+         selectButton.setEnabled(false);
+         processButton.setEnabled(false);
+-        resolutionSpinner.setEnabled(false);
++        resolutionSeekBar.setEnabled(false);
++        formatSpinner.setEnabled(false);
+         saveButton.setEnabled(false);
+         status.setText("Saving " + fileName + "…");
+         executor.execute(() -> {
+-            try (OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
+-                if (out == null) throw new IllegalStateException("Could not open output file.");
+-                writeTiff(out, bitmapToSave);
++            try (OutputStream raw = getContentResolver().openOutputStream(uri, "w")) {
++                if (raw == null) throw new IllegalStateException("Could not open output file.");
++                try (BufferedOutputStream out = new BufferedOutputStream(raw, 64 * 1024)) {
++                    if (format == OutputFormat.DNG) {
++                        DngWriter.write(out, bitmapToSave);
++                    } else if (format == OutputFormat.JPEG) {
++                        if (!bitmapToSave.compress(Bitmap.CompressFormat.JPEG, 95, out)) {
++                            throw new IOException("Android could not encode the JPEG.");
++                        }
++                    } else {
++                        writeTiff(out, bitmapToSave);
++                    }
++                }
+                 runOnUiThread(() -> {
+                     status.setText("Saved " + fileName);
+                     Toast.makeText(this, "Saved " + fileName, Toast.LENGTH_LONG).show();
+                 });
+             } catch (Exception e) {
+                 runOnUiThread(() -> {
+-                    status.setText("TIFF save failed: " + e.getMessage());
+-                    Toast.makeText(this, "TIFF save failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
++                    status.setText(format.shortLabel + " save failed: " + e.getMessage());
++                    Toast.makeText(this, format.shortLabel + " save failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                 });
+             } finally {
+                 runOnUiThread(() -> {
+                     selectButton.setEnabled(true);
+                     processButton.setEnabled(frames.size() >= 2);
+-                    resolutionSpinner.setEnabled(true);
++                    resolutionSeekBar.setEnabled(true);
++                    formatSpinner.setEnabled(true);
+                     saveButton.setEnabled(resultBitmap != null);
+                 });
+             }
+@@ -877,6 +949,24 @@ public class MainActivity extends Activity {
+         }
+     }
+ 
++    private enum OutputFormat {
++        TIFF("TIFF — lossless RGB", "TIFF", "image/tiff", "tif"),
++        DNG("DNG — lossless 16-bit LinearRaw", "DNG", "image/x-adobe-dng", "dng"),
++        JPEG("JPEG — high quality, smaller file", "JPEG", "image/jpeg", "jpg");
++
++        final String label;
++        final String shortLabel;
++        final String mimeType;
++        final String extension;
++
++        OutputFormat(String label, String shortLabel, String mimeType, String extension) {
++            this.label = label;
++            this.shortLabel = shortLabel;
++            this.mimeType = mimeType;
++            this.extension = extension;
++        }
++    }
++
+     private static final class ProcessingCancelledException extends Exception {
+     }
+ }

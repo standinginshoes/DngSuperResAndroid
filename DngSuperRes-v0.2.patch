@@ -1,0 +1,593 @@
+From 58ed0c35654ef5cdf1506d979c1cab88d13954ac Mon Sep 17 00:00:00 2001
+From: OpenAI Codex <codex@openai.com>
+Date: Tue, 1 Sep 2026 05:32:35 +0100
+Subject: [PATCH] Improve burst fusion and add resolution modes
+
+---
+ README.md                                     |  45 +--
+ app/build.gradle                              |   4 +-
+ .../com/openai/dngsuperres/MainActivity.java  | 271 ++++++++++++++----
+ 3 files changed, 251 insertions(+), 69 deletions(-)
+
+diff --git a/README.md b/README.md
+index 3304b94..1ffd8f4 100644
+--- a/README.md
++++ b/README.md
+@@ -1,24 +1,38 @@
+-# DNG Super Resolution (Android MVP)
++# DNG Super Resolution for Android
+ 
+-An offline Android proof-of-concept that accepts a burst of DNG/image frames, automatically picks a sharp reference frame, estimates translation alignment on grayscale previews, projects the full frames onto a 2× output canvas, incrementally averages them, and exports a lossless PNG.
++An offline Android burst processor that aligns DNG/image frames, rejects poor matches and local motion, merges useful image data, and exports an uncompressed RGB TIFF.
+ 
+-## What v0.1 does
++## Output modes
++
++- **Same size (1×):** strongest practical noise reduction without enlarging the image.
++- **1.5×:** recommended balance between denoising, detail recovery, memory, and processing time.
++- **2×:** maximum output detail when the burst contains useful sub-pixel handheld offsets.
++
++Higher resolution modes do not invent detail with a generative model. They combine differently shifted samples from the burst and interpolate the remaining output grid.
++
++## What v0.2 does
+ 
+ - Android Storage Access Framework multi-select (no broad storage permission)
+ - DNG providers with non-image MIME types are supported; bursts are capped at 30 frames
+ - DNG/image decode through Android `ImageDecoder`
+ - automatic reference selection by Laplacian sharpness score
+-- coarse-to-fine gradient-based translational registration, less sensitive to exposure differences
+-- robust frame rejection based on post-alignment residuals to reduce blur and ghosting
+-- fractional shift refinement using a parabolic fit around the alignment minimum
+-- 2× full-resolution projection and sharpness-weighted incremental fusion
++- higher-resolution coarse-to-fine gradient registration with fractional shift refinement
++- per-frame exposure normalization and sharpness/alignment quality weighting
++- whole-frame rejection for badly aligned or highly changed captures
++- robust per-pixel weighting to suppress moving subjects, occlusions, and alignment errors
++- selectable 1×, 1.5×, and 2× full-resolution fusion
+ - standards-compliant RGB TIFF export for the fused rendered image
+ - fully local/offline processing
+-- output size is limited by the device's available memory; allocation failures are reported clearly
++- 70 MP and device-memory safety checks with a clear suggestion to select a lower mode
+ 
+ ## Important limitation
+ 
+-This is the runnable MVP processing path, **not yet true Bayer/CFA RAW super-resolution**. The Pixel DNGs used by this app contain rendered RGB data, so the result is exported as a standards-compliant RGB TIFF. The next engine should use a native DNG/RAW decoder (for example LibRaw) with Bayer DNG input to extract original mosaic samples, preserve black/white levels and CFA metadata, perform local motion/ghost rejection, reconstruct the 2× Bayer plane, demosaic once at the end, and write a high-resolution sensor-raw DNG.
++This is a rendered-image fusion pipeline, **not yet true Bayer/CFA RAW super-resolution**. Android `ImageDecoder` renders each selected DNG before the app receives its pixels, so the current output is an 8-bit RGB TIFF. A future native engine should use a DNG/RAW decoder to extract original mosaic samples, preserve black/white levels and CFA metadata, perform local alignment and motion rejection, reconstruct the Bayer plane, demosaic once at the end, and write a high-bit-depth TIFF or standards-compliant DNG.
++
++The design is informed by Google's published burst photography and handheld multi-frame super-resolution work:
++
++- [Handheld Multi-Frame Super-Resolution](https://research.google/pubs/handheld-multi-frame-super-resolution/)
++- [Burst photography for high dynamic range and low-light imaging on mobile cameras](https://research.google/pubs/burst-photography-for-high-dynamic-range-and-low-light-imaging-on-mobile-cameras/)
+ 
+ ## Build
+ 
+@@ -28,10 +42,9 @@ From a configured command line environment, run `./gradlew assembleDebug` from t
+ 
+ ## Suggested next milestones
+ 
+-1. Native LibRaw DNG ingest via NDK/JNI.
+-2. RAW metadata viewer (CFA, black/white level, ISO, exposure, color matrices).
+-3. Pyramid + tile/local-motion registration.
+-4. Robust outlier/ghost rejection.
+-5. CFA-domain 2× fusion with confidence weights.
+-6. 16-bit TIFF and standards-compliant DNG writer.
+-7. Vulkan/GPU compute path for alignment and reconstruction.
++1. Remove generated desktop build artifacts from the vendored LibRaw tree and wire a minimal Android NDK build.
++2. Native Bayer DNG ingest plus metadata viewer (CFA, black/white level, ISO, exposure, color matrices).
++3. Pyramid and tile-local motion registration for rotation, parallax, and moving subjects.
++4. CFA-domain kernel-regression fusion with confidence weights.
++5. 16-bit TIFF and standards-compliant DNG output.
++6. Vulkan/GPU compute path for alignment and reconstruction.
+diff --git a/app/build.gradle b/app/build.gradle
+index 05ef0b2..75208e9 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -10,7 +10,7 @@ android {
+         applicationId 'com.openai.dngsuperres'
+         minSdk 28
+         targetSdk 35
+-        versionCode 1
+-        versionName '0.1.0'
++        versionCode 2
++        versionName '0.2.0'
+     }
+ }
+diff --git a/app/src/main/java/com/openai/dngsuperres/MainActivity.java b/app/src/main/java/com/openai/dngsuperres/MainActivity.java
+index 843374c..603ef63 100644
+--- a/app/src/main/java/com/openai/dngsuperres/MainActivity.java
++++ b/app/src/main/java/com/openai/dngsuperres/MainActivity.java
+@@ -1,7 +1,6 @@
+ package com.openai.dngsuperres;
+ 
+ import android.app.Activity;
+-import android.content.ContentResolver;
+ import android.content.Intent;
+ import android.graphics.Bitmap;
+ import android.graphics.Canvas;
+@@ -13,13 +12,14 @@ import android.graphics.Paint;
+ import android.net.Uri;
+ import android.os.Bundle;
+ import android.provider.OpenableColumns;
+-import android.view.Gravity;
+ import android.view.View;
+ import android.widget.Button;
++import android.widget.ArrayAdapter;
+ import android.widget.ImageView;
+ import android.widget.LinearLayout;
+ import android.widget.ProgressBar;
+ import android.widget.ScrollView;
++import android.widget.Spinner;
+ import android.widget.TextView;
+ import android.widget.Toast;
+ 
+@@ -35,13 +35,20 @@ import java.util.concurrent.Executors;
+ public class MainActivity extends Activity {
+     private static final int PICK_DNGS = 1001;
+     private static final int SAVE_RESULT = 1002;
+-    private static final int PREVIEW_MAX = 384;
+-    private static final int SEARCH_RADIUS = 14;
++    private static final int PREVIEW_MAX = 512;
++    private static final int SEARCH_RADIUS = 18;
+     private static final int MAX_FRAMES = 30;
+     private static final int DISPLAY_PREVIEW_MAX = 2048;
+     private static final double MAX_GHOST_FRACTION = 0.22;
+-    private static final int PIXEL_GHOST_THRESHOLD = 36;
++    private static final int PIXEL_GHOST_THRESHOLD = 14;
+     private static final int FUSION_TILE_HEIGHT = 256;
++    private static final long MAX_OUTPUT_PIXELS = 70_000_000L;
++    private static final String[] OUTPUT_LABELS = {
++            "Same size (1×) — best noise reduction",
++            "1.5× — recommended balance",
++            "2× — maximum detail"
++    };
++    private static final float[] OUTPUT_SCALES = {1f, 1.5f, 2f};
+ 
+     private final ArrayList<Uri> frames = new ArrayList<>();
+     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+@@ -55,6 +62,10 @@ public class MainActivity extends Activity {
+     private Button processButton;
+     private Button cancelButton;
+     private Button saveButton;
++    private Button selectButton;
++    private Spinner resolutionSpinner;
++    private float selectedOutputScale = 1f;
++    private float resultOutputScale = 1f;
+ 
+     @Override
+     protected void onCreate(Bundle savedInstanceState) {
+@@ -76,19 +87,51 @@ public class MainActivity extends Activity {
+         root.addView(title);
+ 
+         TextView subtitle = new TextView(this);
+-        subtitle.setText("Offline 2× multi-frame stacker • MVP v0.1");
++        subtitle.setText("Offline multi-frame denoise + super resolution • v0.2");
+         subtitle.setTextSize(15);
+         subtitle.setTextColor(Color.DKGRAY);
+         subtitle.setPadding(0, 0, 0, dp(18));
+         root.addView(subtitle);
+ 
+-        Button select = new Button(this);
+-        select.setText("Select DNG burst");
+-        select.setOnClickListener(v -> pickDngs());
+-        root.addView(select, matchWrap());
++        selectButton = new Button(this);
++        selectButton.setText("Select DNG burst");
++        selectButton.setOnClickListener(v -> pickDngs());
++        root.addView(selectButton, matchWrap());
++
++        TextView resolutionLabel = new TextView(this);
++        resolutionLabel.setText("Output resolution");
++        resolutionLabel.setTextSize(16);
++        resolutionLabel.setTextColor(Color.rgb(35, 35, 35));
++        resolutionLabel.setPadding(0, dp(14), 0, dp(4));
++        root.addView(resolutionLabel);
++
++        resolutionSpinner = new Spinner(this);
++        ArrayAdapter<String> resolutionAdapter = new ArrayAdapter<>(this,
++                android.R.layout.simple_spinner_item, OUTPUT_LABELS);
++        resolutionAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
++        resolutionSpinner.setAdapter(resolutionAdapter);
++        resolutionSpinner.setSelection(0);
++        resolutionSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
++            @Override
++            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
++                selectedOutputScale = OUTPUT_SCALES[position];
++                updateProcessButtonLabel();
++            }
++
++            @Override
++            public void onNothingSelected(android.widget.AdapterView<?> parent) { }
++        });
++        root.addView(resolutionSpinner, matchWrap());
++
++        TextView resolutionHint = new TextView(this);
++        resolutionHint.setText("1× merges aligned frames at the original dimensions. Higher modes use sub-pixel burst offsets to recover additional detail.");
++        resolutionHint.setTextSize(13);
++        resolutionHint.setTextColor(Color.DKGRAY);
++        resolutionHint.setPadding(0, dp(4), 0, dp(10));
++        root.addView(resolutionHint);
+ 
+         processButton = new Button(this);
+-        processButton.setText("Build 2× Super Resolution");
++        processButton.setText("Merge at 1×");
+         processButton.setEnabled(false);
+         processButton.setOnClickListener(v -> startProcessing());
+         root.addView(processButton, matchWrap());
+@@ -136,6 +179,14 @@ public class MainActivity extends Activity {
+         return scroll;
+     }
+ 
++    private void updateProcessButtonLabel() {
++        if (processButton != null) processButton.setText("Merge at " + scaleLabel(selectedOutputScale));
++    }
++
++    private String scaleLabel(float scale) {
++        return scale == 1f ? "1×" : scale == 1.5f ? "1.5×" : "2×";
++    }
++
+     private LinearLayout.LayoutParams matchWrap() {
+         return new LinearLayout.LayoutParams(
+                 LinearLayout.LayoutParams.MATCH_PARENT,
+@@ -175,9 +226,7 @@ public class MainActivity extends Activity {
+             processButton.setEnabled(frames.size() >= 2);
+             cancelButton.setEnabled(false);
+             saveButton.setEnabled(false);
+-            resultBitmap = null;
+-            if (resultPreview != null && !resultPreview.isRecycled()) resultPreview.recycle();
+-            resultPreview = null;
++            clearResult();
+             previewImage.setImageDrawable(null);
+         } else if (requestCode == SAVE_RESULT && data.getData() != null) {
+             saveResult(data.getData());
+@@ -194,7 +243,12 @@ public class MainActivity extends Activity {
+ 
+     private void startProcessing() {
+         final ArrayList<Uri> snapshot = new ArrayList<>(frames);
++        final float outputScale = selectedOutputScale;
++        clearResult();
++        previewImage.setImageDrawable(null);
+         processButton.setEnabled(false);
++        selectButton.setEnabled(false);
++        resolutionSpinner.setEnabled(false);
+         cancelButton.setEnabled(true);
+         saveButton.setEnabled(false);
+         progress.setProgress(0);
+@@ -202,8 +256,10 @@ public class MainActivity extends Activity {
+         cancelRequested = false;
+ 
+         executor.execute(() -> {
++            List<FrameInfo> info = new ArrayList<>();
++            Bitmap refFull = null;
++            Bitmap out = null;
+             try {
+-                List<FrameInfo> info = new ArrayList<>();
+                 for (int i = 0; i < snapshot.size(); i++) {
+                     checkCancelled();
+                     Bitmap preview = decodePreview(snapshot.get(i));
+@@ -239,15 +295,18 @@ public class MainActivity extends Activity {
+                     updateProgress(20 + (int)(30.0 * (i + 1) / info.size()), "Aligned " + (i + 1) + "/" + info.size());
+                 }
+ 
+-                Bitmap refFull = decodeFull(ref.uri);
++                refFull = decodeFull(ref.uri);
+                 if (refFull == null) throw new IllegalStateException("Reference DNG could not be decoded at full resolution.");
+                 int w = refFull.getWidth();
+                 int h = refFull.getHeight();
+-                Bitmap out;
++                int outputWidth = Math.round(w * outputScale);
++                int outputHeight = Math.round(h * outputScale);
++                validateOutputSize(w, h, outputWidth, outputHeight);
+                 try {
+-                    out = Bitmap.createBitmap(w * 2, h * 2, Bitmap.Config.ARGB_8888);
++                    out = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888);
+                 } catch (OutOfMemoryError e) {
+-                    throw new IllegalStateException("Not enough memory for the " + (w * 2) + "×" + (h * 2) + " output. Use fewer or smaller DNGs.", e);
++                    throw new IllegalStateException("Not enough memory for the " + outputWidth + "×" + outputHeight
++                            + " output. Choose a lower output resolution.", e);
+                 }
+                 Canvas canvas = new Canvas(out);
+                 Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
+@@ -262,9 +321,16 @@ public class MainActivity extends Activity {
+                 for (FrameInfo f : info) {
+                     if (f != ref && f.alignmentCost <= rejectCost && f.ghostFraction <= MAX_GHOST_FRACTION) ordered.add(f);
+                 }
++                ordered.subList(1, ordered.size()).sort(Comparator.comparingDouble(
++                        (FrameInfo f) -> qualityWeight(f, ref)).reversed());
+                 if (ordered.size() == 1 && info.size() > 1) {
+-                    FrameInfo best = Collections.min(info, Comparator.comparingDouble(f -> f.alignmentCost));
+-                    if (best != ref) ordered.add(best);
++                    FrameInfo best = null;
++                    for (FrameInfo candidate : info) {
++                        if (candidate != ref && (best == null || candidate.alignmentCost < best.alignmentCost)) {
++                            best = candidate;
++                        }
++                    }
++                    if (best != null) ordered.add(best);
+                 }
+                 final int rejectedCount = info.size() - ordered.size();
+                 runOnUiThread(() -> status.setText("Stacking " + ordered.size() + " frames" +
+@@ -286,23 +352,18 @@ public class MainActivity extends Activity {
+                     float dxFull = (float)f.dxPreview * previewScaleX;
+                     float dyFull = (float)f.dyPreview * previewScaleY;
+ 
+-                    // Down-weight soft frames while retaining a contribution from every capture.
+-                    double sharpnessRatio = f.sharpness / Math.max(ref.sharpness, 1e-9);
+-                    double sharpnessWeight = Math.max(0.35, Math.min(1.0, sharpnessRatio));
+-                    double alignmentWeight = Math.exp(-f.alignmentCost / 24.0);
+-                    double ghostWeight = 1.0 - Math.min(1.0, f.ghostFraction / MAX_GHOST_FRACTION);
+-                    double qualityWeight = sharpnessWeight * Math.max(0.15, Math.min(1.0, alignmentWeight)) * ghostWeight;
+-                    qualityWeight = Math.max(0.15, Math.min(1.0, qualityWeight));
++                    double qualityWeight = qualityWeight(f, ref);
+                     double alpha = i == 0 ? 1.0 : qualityWeight / (totalWeight + qualityWeight);
+                     paint.setAlpha(Math.max(1, Math.min(255, Math.round((float)(alpha * 255.0)))));
+                     paint.setColorFilter(colorFilterFor(f.exposureScale));
+                     canvas.save();
+-                    canvas.scale(2f, 2f);
++                    canvas.scale(outputScale, outputScale);
+                     canvas.translate(-dxFull, -dyFull);
+                     if (i == 0) {
+                         canvas.drawBitmap(full, 0f, 0f, paint);
+                     } else {
+-                        drawGhostRejectedTiles(canvas, full, refFull, Math.round(dxFull), Math.round(dyFull), paint);
++                        drawGhostRejectedTiles(canvas, full, refFull, Math.round(dxFull), Math.round(dyFull),
++                                f.exposureScale, paint);
+                     }
+                     canvas.restore();
+                     paint.setColorFilter(null);
+@@ -312,15 +373,17 @@ public class MainActivity extends Activity {
+                     updateProgress(50 + (int)(48.0 * (i + 1) / ordered.size()), "Stacking " + (i + 1) + "/" + ordered.size());
+                 }
+ 
+-                for (FrameInfo f : info) f.preview.recycle();
+-                refFull.recycle();
+-                resultBitmap = out;
++                Bitmap completed = out;
++                resultBitmap = completed;
++                resultOutputScale = outputScale;
+                 runOnUiThread(() -> {
+                     progress.setProgress(100);
+-                    status.setText("Done • " + out.getWidth() + "×" + out.getHeight() + " • " + ordered.size() + " frames");
+-                    resultPreview = makeDisplayPreview(out);
++                    status.setText("Done • " + completed.getWidth() + "×" + completed.getHeight() + " • " + ordered.size() + " frames");
++                    resultPreview = makeDisplayPreview(completed);
+                     previewImage.setImageBitmap(resultPreview);
+                     processButton.setEnabled(true);
++                    selectButton.setEnabled(true);
++                    resolutionSpinner.setEnabled(true);
+                     cancelButton.setEnabled(false);
+                     saveButton.setEnabled(true);
+                 });
+@@ -328,12 +391,20 @@ public class MainActivity extends Activity {
+                 runOnUiThread(() -> {
+                     status.setText(t instanceof ProcessingCancelledException ? "Processing cancelled" : "Processing failed: " + t.getMessage());
+                     processButton.setEnabled(true);
++                    selectButton.setEnabled(true);
++                    resolutionSpinner.setEnabled(true);
+                     cancelButton.setEnabled(false);
+                     saveButton.setEnabled(false);
+                     if (!(t instanceof ProcessingCancelledException)) {
+                         Toast.makeText(this, t.getMessage(), Toast.LENGTH_LONG).show();
+                     }
+                 });
++            } finally {
++                for (FrameInfo frame : info) {
++                    if (frame.preview != null && !frame.preview.isRecycled()) frame.preview.recycle();
++                }
++                if (refFull != null && !refFull.isRecycled()) refFull.recycle();
++                if (out != null && out != resultBitmap && !out.isRecycled()) out.recycle();
+             }
+         });
+     }
+@@ -440,6 +511,10 @@ public class MainActivity extends Activity {
+     }
+ 
+     private double ghostFraction(Bitmap reference, Bitmap image, int dx, int dy, double exposureScale) {
++        Bitmap candidate = image;
++        if (image.getWidth() != reference.getWidth() || image.getHeight() != reference.getHeight()) {
++            candidate = Bitmap.createScaledBitmap(image, reference.getWidth(), reference.getHeight(), true);
++        }
+         int width = reference.getWidth();
+         int height = reference.getHeight();
+         int margin = SEARCH_RADIUS + 5;
+@@ -452,16 +527,17 @@ public class MainActivity extends Activity {
+                 int imageX = x + dx;
+                 if (imageX < 1 || imageX >= width) continue;
+                 int referenceCenter = luma(reference.getPixel(x, y));
+-                int imageCenter = scaledLuma(image.getPixel(imageX, imageY), exposureScale);
++                int imageCenter = scaledLuma(candidate.getPixel(imageX, imageY), exposureScale);
+                 int referenceGradient = Math.abs(referenceCenter - luma(reference.getPixel(x - 1, y)))
+                         + Math.abs(referenceCenter - luma(reference.getPixel(x, y - 1)));
+-                int imageGradient = Math.abs(imageCenter - scaledLuma(image.getPixel(imageX - 1, imageY), exposureScale))
+-                    + Math.abs(imageCenter - scaledLuma(image.getPixel(imageX, imageY - 1), exposureScale));
++                int imageGradient = Math.abs(imageCenter - scaledLuma(candidate.getPixel(imageX - 1, imageY), exposureScale))
++                    + Math.abs(imageCenter - scaledLuma(candidate.getPixel(imageX, imageY - 1), exposureScale));
+                 if (Math.abs(referenceGradient - imageGradient) > 42
+                         && Math.abs(referenceCenter - imageCenter) > 28) changed++;
+                 samples++;
+             }
+         }
++        if (candidate != image) candidate.recycle();
+         return samples == 0 ? 1.0 : (double)changed / samples;
+     }
+ 
+@@ -496,7 +572,36 @@ public class MainActivity extends Activity {
+         }));
+     }
+ 
+-    private void drawGhostRejectedTiles(Canvas canvas, Bitmap image, Bitmap reference, int dx, int dy, Paint paint) {
++    private double qualityWeight(FrameInfo frame, FrameInfo reference) {
++        if (frame == reference) return 1.0;
++        double sharpnessRatio = frame.sharpness / Math.max(reference.sharpness, 1e-9);
++        double sharpnessWeight = Math.max(0.25, Math.min(1.0, sharpnessRatio));
++        double alignmentWeight = Math.exp(-frame.alignmentCost / 24.0);
++        double motionWeight = 1.0 - Math.min(1.0, frame.ghostFraction / MAX_GHOST_FRACTION);
++        return Math.max(0.05, Math.min(1.0,
++                sharpnessWeight * Math.max(0.10, alignmentWeight) * motionWeight));
++    }
++
++    private void validateOutputSize(int inputWidth, int inputHeight, int outputWidth, int outputHeight) {
++        long inputPixels = (long)inputWidth * inputHeight;
++        long outputPixels = (long)outputWidth * outputHeight;
++        if (outputPixels <= 0 || outputPixels > MAX_OUTPUT_PIXELS) {
++            throw new IllegalStateException("The selected mode would create " + outputWidth + "×" + outputHeight
++                    + " (" + (outputPixels / 1_000_000L) + " MP). Choose a lower resolution; the safety limit is 70 MP.");
++        }
++
++        long previewBytes = (long)PREVIEW_MAX * PREVIEW_MAX * 4L * Math.min(frames.size(), MAX_FRAMES);
++        long estimatedBytes = outputPixels * 4L + inputPixels * 8L + previewBytes + 32L * 1024L * 1024L;
++        long safeBudget = Runtime.getRuntime().maxMemory() * 85L / 100L;
++        if (estimatedBytes > safeBudget) {
++            throw new IllegalStateException("This mode needs about " + (estimatedBytes / (1024L * 1024L))
++                    + " MB while this device allows about " + (safeBudget / (1024L * 1024L))
++                    + " MB safely. Choose a lower output resolution.");
++        }
++    }
++
++    private void drawGhostRejectedTiles(Canvas canvas, Bitmap image, Bitmap reference, int dx, int dy,
++                                         double exposureScale, Paint paint) {
+         int width = image.getWidth();
+         int height = image.getHeight();
+         int[] imagePixels = new int[width * FUSION_TILE_HEIGHT];
+@@ -507,16 +612,35 @@ public class MainActivity extends Activity {
+             for (int row = 0; row < tileHeight; row++) {
+                 int y = top + row;
+                 int referenceY = y - dy;
+-                if (referenceY < 0 || referenceY >= height) continue;
++                if (referenceY < 0 || referenceY >= height) {
++                    for (int x = 0; x < width; x++) {
++                        int index = row * width + x;
++                        int color = imagePixels[index];
++                        imagePixels[index] = Color.argb(0, Color.red(color), Color.green(color), Color.blue(color));
++                    }
++                    continue;
++                }
+                 reference.getPixels(referenceRow, 0, width, 0, referenceY, width, 1);
+                 for (int x = 0; x < width; x++) {
+                     int referenceX = x - dx;
+-                    if (referenceX < 0 || referenceX >= width) continue;
+                     int index = row * width + x;
+                     int color = imagePixels[index];
+-                    int difference = Math.abs(luma(color) - luma(referenceRow[referenceX]));
+-                    int localWeight = difference <= PIXEL_GHOST_THRESHOLD ? 255
+-                            : Math.max(0, 255 - (difference - PIXEL_GHOST_THRESHOLD) * 8);
++                    if (referenceX < 0 || referenceX >= width) {
++                        imagePixels[index] = Color.argb(0, Color.red(color), Color.green(color), Color.blue(color));
++                        continue;
++                    }
++                    int referenceColor = referenceRow[referenceX];
++                    int referenceLuma = luma(referenceColor);
++                    int candidateLuma = scaledLuma(color, exposureScale);
++                    int lumaResidual = Math.abs(candidateLuma - referenceLuma);
++                    int colorResidual = Math.max(
++                            Math.abs(scaleChannel(Color.red(color), exposureScale) - Color.red(referenceColor)),
++                            Math.max(
++                                    Math.abs(scaleChannel(Color.green(color), exposureScale) - Color.green(referenceColor)),
++                                    Math.abs(scaleChannel(Color.blue(color), exposureScale) - Color.blue(referenceColor))));
++                    int difference = Math.max(lumaResidual, colorResidual / 2);
++                    int threshold = PIXEL_GHOST_THRESHOLD + referenceLuma / 16;
++                    int localWeight = robustPixelWeight(difference, threshold);
+                     imagePixels[index] = Color.argb(localWeight, Color.red(color), Color.green(color), Color.blue(color));
+                 }
+             }
+@@ -526,6 +650,18 @@ public class MainActivity extends Activity {
+         }
+     }
+ 
++    private int robustPixelWeight(int difference, int threshold) {
++        if (difference <= threshold) return 255;
++        double normalized = (difference - threshold) / (double)Math.max(1, threshold * 2);
++        if (normalized >= 1.0) return 0;
++        double value = 1.0 - normalized * normalized;
++        return (int)Math.round(255.0 * value * value);
++    }
++
++    private int scaleChannel(int value, double scale) {
++        return Math.max(0, Math.min(255, (int)Math.round(value * scale)));
++    }
++
+     private int luma(int c) {
+         return (77 * Color.red(c) + 150 * Color.green(c) + 29 * Color.blue(c)) >> 8;
+     }
+@@ -535,19 +671,44 @@ public class MainActivity extends Activity {
+         Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+         i.addCategory(Intent.CATEGORY_OPENABLE);
+         i.setType("image/tiff");
+-        i.putExtra(Intent.EXTRA_TITLE, "SuperRes_2x.tif");
++        i.putExtra(Intent.EXTRA_TITLE, outputFileName());
+         startActivityForResult(i, SAVE_RESULT);
+     }
+ 
++    private String outputFileName() {
++        String scale = resultOutputScale == 1f ? "1x" : resultOutputScale == 1.5f ? "1_5x" : "2x";
++        return "SuperRes_" + scale + ".tif";
++    }
++
+     private void saveResult(Uri uri) {
+         if (resultBitmap == null) return;
++        Bitmap bitmapToSave = resultBitmap;
++        String fileName = outputFileName();
++        selectButton.setEnabled(false);
++        processButton.setEnabled(false);
++        resolutionSpinner.setEnabled(false);
++        saveButton.setEnabled(false);
++        status.setText("Saving " + fileName + "…");
+         executor.execute(() -> {
+             try (OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
+                 if (out == null) throw new IllegalStateException("Could not open output file.");
+-                writeTiff(out, resultBitmap);
+-                runOnUiThread(() -> Toast.makeText(this, "Saved SuperRes_2x.tif", Toast.LENGTH_LONG).show());
++                writeTiff(out, bitmapToSave);
++                runOnUiThread(() -> {
++                    status.setText("Saved " + fileName);
++                    Toast.makeText(this, "Saved " + fileName, Toast.LENGTH_LONG).show();
++                });
+             } catch (Exception e) {
+-                runOnUiThread(() -> Toast.makeText(this, "TIFF save failed: " + e.getMessage(), Toast.LENGTH_LONG).show());
++                runOnUiThread(() -> {
++                    status.setText("TIFF save failed: " + e.getMessage());
++                    Toast.makeText(this, "TIFF save failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
++                });
++            } finally {
++                runOnUiThread(() -> {
++                    selectButton.setEnabled(true);
++                    processButton.setEnabled(frames.size() >= 2);
++                    resolutionSpinner.setEnabled(true);
++                    saveButton.setEnabled(resultBitmap != null);
++                });
+             }
+         });
+     }
+@@ -644,11 +805,19 @@ public class MainActivity extends Activity {
+                 Math.max(1, Math.round(source.getHeight() * scale)), true);
+     }
+ 
++    private void clearResult() {
++        Bitmap oldResult = resultBitmap;
++        Bitmap oldPreview = resultPreview;
++        resultBitmap = null;
++        resultPreview = null;
++        if (oldPreview != null && oldPreview != oldResult && !oldPreview.isRecycled()) oldPreview.recycle();
++        if (oldResult != null && !oldResult.isRecycled()) oldResult.recycle();
++    }
++
+     @Override
+     protected void onDestroy() {
+         executor.shutdownNow();
+-        if (resultBitmap != null && !resultBitmap.isRecycled()) resultBitmap.recycle();
+-        if (resultPreview != null && !resultPreview.isRecycled() && resultPreview != resultBitmap) resultPreview.recycle();
++        clearResult();
+         super.onDestroy();
+     }
+ 
+@@ -664,7 +833,7 @@ public class MainActivity extends Activity {
+     }
+ 
+     private void checkCancelled() throws ProcessingCancelledException {
+-        if (cancelRequested) throw new ProcessingCancelledException();
++        if (cancelRequested || Thread.currentThread().isInterrupted()) throw new ProcessingCancelledException();
+     }
+ 
+     private double median(double[] values) {
+-- 
+2.51.1
+
