@@ -39,11 +39,13 @@ public class MainActivity extends Activity {
     private static final int SAVE_RESULT = 1002;
     private static final int PREVIEW_MAX = 512;
     private static final int SEARCH_RADIUS = 18;
+    private static final int MOTION_GRID_SIZE = 5;
+    private static final int LOCAL_SEARCH_RADIUS = 7;
     private static final int MAX_FRAMES = 30;
     private static final int DISPLAY_PREVIEW_MAX = 2048;
     private static final double MAX_GHOST_FRACTION = 0.22;
     private static final int PIXEL_GHOST_THRESHOLD = 14;
-    private static final int FUSION_TILE_HEIGHT = 256;
+    private static final int FUSION_TILE_SIZE = 512;
     private static final long MAX_OUTPUT_PIXELS = 70_000_000L;
     private static final int OUTPUT_SCALE_STEPS = 20;
     private static final float OUTPUT_SCALE_STEP = 0.05f;
@@ -89,7 +91,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("Offline multi-frame denoise + super resolution • v0.6");
+        subtitle.setText("Offline local-motion denoise + super resolution • v0.7");
         subtitle.setTextSize(15);
         subtitle.setTextColor(Color.DKGRAY);
         subtitle.setPadding(0, 0, 0, dp(18));
@@ -321,11 +323,12 @@ public class MainActivity extends Activity {
                     Bitmap preview = decodePreview(snapshot.get(i));
                     if (preview == null) throw new IllegalStateException("Could not decode " + displayName(snapshot.get(i)));
                     double sharpness = sharpness(preview);
-                    info.add(new FrameInfo(snapshot.get(i), preview, sharpness));
+                    double clippedFraction = clippedFraction(preview);
+                    info.add(new FrameInfo(snapshot.get(i), preview, sharpness, clippedFraction));
                     updateProgress((int)(20.0 * (i + 1) / snapshot.size()), "Analyzing frame " + (i + 1) + "/" + snapshot.size());
                 }
 
-                FrameInfo ref = Collections.max(info, Comparator.comparingDouble(f -> f.sharpness));
+                FrameInfo ref = Collections.max(info, Comparator.comparingDouble(this::referenceScore));
                 double referenceLuma = medianLuma(ref.preview);
                 for (FrameInfo f : info) {
                     f.exposureScale = Math.max(0.75, Math.min(1.33,
@@ -340,13 +343,18 @@ public class MainActivity extends Activity {
                         f.dxPreview = 0;
                         f.dyPreview = 0;
                         f.alignmentCost = 0;
+                        f.motionField = MotionField.identity(ref.preview.getWidth(), ref.preview.getHeight());
                     } else {
-                        double[] shift = estimateShift(ref.preview, f.preview);
-                        f.dxPreview = shift[0];
-                        f.dyPreview = shift[1];
-                        f.alignmentCost = shift[2];
-                        f.ghostFraction = ghostFraction(ref.preview, f.preview, (int)Math.round(shift[0]),
-                            (int)Math.round(shift[1]), f.exposureScale);
+                        double[] shift = estimateShift(ref.preview, f.preview, f.exposureScale);
+                        f.motionField = estimateMotionField(ref.preview, f.preview,
+                                shift[0], shift[1], f.exposureScale);
+                        float[] centerShift = new float[2];
+                        f.motionField.shiftAt(ref.preview.getWidth() * 0.5f,
+                                ref.preview.getHeight() * 0.5f, centerShift);
+                        f.dxPreview = centerShift[0];
+                        f.dyPreview = centerShift[1];
+                        f.alignmentCost = f.motionField.medianCost;
+                        f.ghostFraction = ghostFraction(ref.preview, f.preview, f.motionField, f.exposureScale);
                     }
                     updateProgress(20 + (int)(30.0 * (i + 1) / info.size()), "Aligned " + (i + 1) + "/" + info.size());
                 }
@@ -403,22 +411,16 @@ public class MainActivity extends Activity {
                         continue;
                     }
 
-                    float previewScaleX = (float)w / (float)f.preview.getWidth();
-                    float previewScaleY = (float)h / (float)f.preview.getHeight();
-                    float dxFull = (float)f.dxPreview * previewScaleX;
-                    float dyFull = (float)f.dyPreview * previewScaleY;
-
                     double qualityWeight = qualityWeight(f, ref);
                     double alpha = i == 0 ? 1.0 : qualityWeight / (totalWeight + qualityWeight);
                     paint.setAlpha(Math.max(1, Math.min(255, Math.round((float)(alpha * 255.0)))));
                     paint.setColorFilter(colorFilterFor(f.exposureScale));
                     canvas.save();
                     canvas.scale(outputScale, outputScale);
-                    canvas.translate(-dxFull, -dyFull);
                     if (i == 0) {
                         canvas.drawBitmap(full, 0f, 0f, paint);
                     } else {
-                        drawGhostRejectedTiles(canvas, full, refFull, Math.round(dxFull), Math.round(dyFull),
+                        drawLocallyAlignedTiles(canvas, full, refFull, f.motionField,
                                 f.exposureScale, paint);
                     }
                     canvas.restore();
@@ -520,7 +522,7 @@ public class MainActivity extends Activity {
         return count == 0 ? 0 : sum / count;
     }
 
-    private double[] estimateShift(Bitmap ref, Bitmap img) {
+    private double[] estimateShift(Bitmap ref, Bitmap img, double exposureScale) {
         Bitmap candidate = img;
         if (img.getWidth() != ref.getWidth() || img.getHeight() != ref.getHeight()) {
             candidate = Bitmap.createScaledBitmap(img, ref.getWidth(), ref.getHeight(), true);
@@ -529,7 +531,7 @@ public class MainActivity extends Activity {
         double best = Double.POSITIVE_INFINITY;
         for (int dy = -SEARCH_RADIUS; dy <= SEARCH_RADIUS; dy += 2) {
             for (int dx = -SEARCH_RADIUS; dx <= SEARCH_RADIUS; dx += 2) {
-                double s = shiftCost(ref, candidate, dx, dy, 4);
+                double s = shiftCost(ref, candidate, dx, dy, 4, exposureScale);
                 if (s < best) { best = s; bestX = dx; bestY = dy; }
             }
         }
@@ -537,20 +539,267 @@ public class MainActivity extends Activity {
         best = Double.POSITIVE_INFINITY;
         for (int dy = coarseY - 2; dy <= coarseY + 2; dy++) {
             for (int dx = coarseX - 2; dx <= coarseX + 2; dx++) {
-                double s = shiftCost(ref, candidate, dx, dy, 2);
+                double s = shiftCost(ref, candidate, dx, dy, 2, exposureScale);
                 if (s < best) { best = s; bestX = dx; bestY = dy; }
             }
         }
-        double cxm = shiftCost(ref, candidate, bestX - 1, bestY, 2);
-        double cx0 = shiftCost(ref, candidate, bestX, bestY, 2);
-        double cxp = shiftCost(ref, candidate, bestX + 1, bestY, 2);
-        double cym = shiftCost(ref, candidate, bestX, bestY - 1, 2);
+        double cxm = shiftCost(ref, candidate, bestX - 1, bestY, 2, exposureScale);
+        double cx0 = shiftCost(ref, candidate, bestX, bestY, 2, exposureScale);
+        double cxp = shiftCost(ref, candidate, bestX + 1, bestY, 2, exposureScale);
+        double cym = shiftCost(ref, candidate, bestX, bestY - 1, 2, exposureScale);
         double cy0 = cx0;
-        double cyp = shiftCost(ref, candidate, bestX, bestY + 1, 2);
+        double cyp = shiftCost(ref, candidate, bestX, bestY + 1, 2, exposureScale);
         double subX = parabolicOffset(cxm, cx0, cxp);
         double subY = parabolicOffset(cym, cy0, cyp);
         if (candidate != img) candidate.recycle();
         return new double[]{bestX + subX, bestY + subY, best};
+    }
+
+    private MotionField estimateMotionField(Bitmap reference, Bitmap image, double globalDx,
+                                             double globalDy, double exposureScale)
+            throws ProcessingCancelledException {
+        Bitmap candidate = image;
+        if (image.getWidth() != reference.getWidth() || image.getHeight() != reference.getHeight()) {
+            candidate = Bitmap.createScaledBitmap(image, reference.getWidth(), reference.getHeight(), true);
+        }
+        int width = reference.getWidth();
+        int height = reference.getHeight();
+        int patchRadius = Math.max(18, Math.min(42, Math.min(width, height) / 9));
+        int margin = patchRadius + LOCAL_SEARCH_RADIUS + 3;
+        if (width <= margin * 2 + 8 || height <= margin * 2 + 8) {
+            if (candidate != image) candidate.recycle();
+            return MotionField.translation(width, height, (float)globalDx, (float)globalDy, 0);
+        }
+
+        float minX = margin;
+        float minY = margin;
+        float maxX = width - 1f - margin;
+        float maxY = height - 1f - margin;
+        ArrayList<MotionSample> samples = new ArrayList<>(MOTION_GRID_SIZE * MOTION_GRID_SIZE);
+        double[] costs = new double[MOTION_GRID_SIZE * MOTION_GRID_SIZE];
+        int index = 0;
+        for (int gy = 0; gy < MOTION_GRID_SIZE; gy++) {
+            checkCancelled();
+            float y = minY + (maxY - minY) * gy / (MOTION_GRID_SIZE - 1f);
+            for (int gx = 0; gx < MOTION_GRID_SIZE; gx++) {
+                float x = minX + (maxX - minX) * gx / (MOTION_GRID_SIZE - 1f);
+                LocalShift local = estimateLocalShift(reference, candidate, Math.round(x), Math.round(y),
+                        globalDx, globalDy, patchRadius, exposureScale);
+                MotionSample sample = new MotionSample(x, y, width, height, local);
+                samples.add(sample);
+                costs[index++] = local.cost;
+            }
+        }
+
+        double medianCost = medianFinite(costs, 0);
+        double[] modelX = fitShiftModel(samples, true, globalDx);
+        double[] modelY = fitShiftModel(samples, false, globalDy);
+        double[] residuals = new double[samples.size()];
+        for (int i = 0; i < samples.size(); i++) {
+            MotionSample sample = samples.get(i);
+            double predictedX = modelValue(modelX, sample.u, sample.v);
+            double predictedY = modelValue(modelY, sample.u, sample.v);
+            residuals[i] = Math.hypot(sample.dx - predictedX, sample.dy - predictedY);
+        }
+        double medianResidual = medianFinite(residuals, 0);
+        double robustScale = Math.max(1.25, medianResidual * 2.5);
+        for (int i = 0; i < samples.size(); i++) {
+            double normalized = residuals[i] / robustScale;
+            samples.get(i).robustWeight = 1.0 / (1.0 + normalized * normalized * normalized * normalized);
+        }
+        modelX = fitShiftModel(samples, true, globalDx);
+        modelY = fitShiftModel(samples, false, globalDy);
+
+        float[] shiftsX = new float[samples.size()];
+        float[] shiftsY = new float[samples.size()];
+        float[] affineX = new float[samples.size()];
+        float[] affineY = new float[samples.size()];
+        double maximumResidual = Math.max(2.25, medianResidual * 2.75);
+        double maximumCost = Math.max(medianCost + 6.0, medianCost * 2.5);
+        for (int i = 0; i < samples.size(); i++) {
+            MotionSample sample = samples.get(i);
+            float predictedX = (float)modelValue(modelX, sample.u, sample.v);
+            float predictedY = (float)modelValue(modelY, sample.u, sample.v);
+            affineX[i] = predictedX;
+            affineY[i] = predictedY;
+            double residual = Math.hypot(sample.dx - predictedX, sample.dy - predictedY);
+            boolean unreliable = sample.texture < 3.0 || sample.cost > maximumCost
+                    || residual > maximumResidual || !Double.isFinite(sample.cost);
+            if (unreliable) {
+                shiftsX[i] = predictedX;
+                shiftsY[i] = predictedY;
+            } else {
+                shiftsX[i] = predictedX + 0.75f * ((float)sample.dx - predictedX);
+                shiftsY[i] = predictedY + 0.75f * ((float)sample.dy - predictedY);
+            }
+        }
+
+        // Smooth only the local residual. The affine component remains untouched, so rotation
+        // and small scale changes are preserved while isolated moving objects cannot bend the mesh.
+        float[] smoothX = shiftsX.clone();
+        float[] smoothY = shiftsY.clone();
+        for (int gy = 0; gy < MOTION_GRID_SIZE; gy++) {
+            for (int gx = 0; gx < MOTION_GRID_SIZE; gx++) {
+                int center = gy * MOTION_GRID_SIZE + gx;
+                float residualX = 0f;
+                float residualY = 0f;
+                int count = 0;
+                for (int ny = Math.max(0, gy - 1); ny <= Math.min(MOTION_GRID_SIZE - 1, gy + 1); ny++) {
+                    for (int nx = Math.max(0, gx - 1); nx <= Math.min(MOTION_GRID_SIZE - 1, gx + 1); nx++) {
+                        int neighbor = ny * MOTION_GRID_SIZE + nx;
+                        residualX += shiftsX[neighbor] - affineX[neighbor];
+                        residualY += shiftsY[neighbor] - affineY[neighbor];
+                        count++;
+                    }
+                }
+                smoothX[center] = affineX[center] + residualX / Math.max(1, count);
+                smoothY[center] = affineY[center] + residualY / Math.max(1, count);
+            }
+        }
+        if (candidate != image) candidate.recycle();
+        return new MotionField(width, height, minX, minY, maxX, maxY,
+                smoothX, smoothY, medianCost);
+    }
+
+    private LocalShift estimateLocalShift(Bitmap reference, Bitmap candidate, int centerX, int centerY,
+                                          double initialDx, double initialDy, int patchRadius,
+                                          double exposureScale) {
+        int initialX = (int)Math.round(initialDx);
+        int initialY = (int)Math.round(initialDy);
+        int bestX = initialX;
+        int bestY = initialY;
+        double bestCost = Double.POSITIVE_INFINITY;
+        for (int dy = initialY - LOCAL_SEARCH_RADIUS; dy <= initialY + LOCAL_SEARCH_RADIUS; dy++) {
+            for (int dx = initialX - LOCAL_SEARCH_RADIUS; dx <= initialX + LOCAL_SEARCH_RADIUS; dx++) {
+                double cost = patchShiftCost(reference, candidate, centerX, centerY,
+                        dx, dy, patchRadius, 2, exposureScale);
+                if (cost < bestCost) {
+                    bestCost = cost;
+                    bestX = dx;
+                    bestY = dy;
+                }
+            }
+        }
+        double centerCost = patchShiftCost(reference, candidate, centerX, centerY,
+                bestX, bestY, patchRadius, 2, exposureScale);
+        double subX = parabolicOffset(
+                patchShiftCost(reference, candidate, centerX, centerY,
+                        bestX - 1, bestY, patchRadius, 2, exposureScale),
+                centerCost,
+                patchShiftCost(reference, candidate, centerX, centerY,
+                        bestX + 1, bestY, patchRadius, 2, exposureScale));
+        double subY = parabolicOffset(
+                patchShiftCost(reference, candidate, centerX, centerY,
+                        bestX, bestY - 1, patchRadius, 2, exposureScale),
+                centerCost,
+                patchShiftCost(reference, candidate, centerX, centerY,
+                        bestX, bestY + 1, patchRadius, 2, exposureScale));
+        double texture = patchTexture(reference, centerX, centerY, patchRadius, 3);
+        return new LocalShift(bestX + subX, bestY + subY, bestCost, texture);
+    }
+
+    private double patchShiftCost(Bitmap reference, Bitmap candidate, int centerX, int centerY,
+                                  int dx, int dy, int radius, int step, double exposureScale) {
+        long total = 0;
+        int count = 0;
+        int minY = Math.max(2, centerY - radius);
+        int maxY = Math.min(reference.getHeight() - 2, centerY + radius);
+        int minX = Math.max(2, centerX - radius);
+        int maxX = Math.min(reference.getWidth() - 2, centerX + radius);
+        for (int y = minY; y <= maxY; y += step) {
+            int candidateY = y + dy;
+            if (candidateY < 2 || candidateY >= candidate.getHeight() - 1) continue;
+            for (int x = minX; x <= maxX; x += step) {
+                int candidateX = x + dx;
+                if (candidateX < 2 || candidateX >= candidate.getWidth() - 1) continue;
+                int referenceCenter = luma(reference.getPixel(x, y));
+                int candidateCenter = scaledLuma(candidate.getPixel(candidateX, candidateY), exposureScale);
+                int referenceHorizontal = referenceCenter - luma(reference.getPixel(x - 1, y));
+                int candidateHorizontal = candidateCenter
+                        - scaledLuma(candidate.getPixel(candidateX - 1, candidateY), exposureScale);
+                int referenceVertical = referenceCenter - luma(reference.getPixel(x, y - 1));
+                int candidateVertical = candidateCenter
+                        - scaledLuma(candidate.getPixel(candidateX, candidateY - 1), exposureScale);
+                total += Math.abs(referenceHorizontal - candidateHorizontal)
+                        + Math.abs(referenceVertical - candidateVertical);
+                count++;
+            }
+        }
+        return count < 32 ? Double.POSITIVE_INFINITY : total / (double)count;
+    }
+
+    private double patchTexture(Bitmap bitmap, int centerX, int centerY, int radius, int step) {
+        long total = 0;
+        int count = 0;
+        for (int y = Math.max(1, centerY - radius); y <= Math.min(bitmap.getHeight() - 2, centerY + radius); y += step) {
+            for (int x = Math.max(1, centerX - radius); x <= Math.min(bitmap.getWidth() - 2, centerX + radius); x += step) {
+                int center = luma(bitmap.getPixel(x, y));
+                total += Math.abs(center - luma(bitmap.getPixel(x - 1, y)))
+                        + Math.abs(center - luma(bitmap.getPixel(x, y - 1)));
+                count++;
+            }
+        }
+        return count == 0 ? 0 : total / (double)count;
+    }
+
+    private double[] fitShiftModel(List<MotionSample> samples, boolean horizontal, double fallback) {
+        double[][] normal = new double[3][4];
+        for (MotionSample sample : samples) {
+            double textureWeight = Math.max(0.05, Math.min(1.0, sample.texture / 18.0));
+            double costWeight = Double.isFinite(sample.cost) ? 1.0 / (1.0 + sample.cost / 12.0) : 0.0;
+            double weight = textureWeight * costWeight * sample.robustWeight;
+            double[] feature = {1.0, sample.u, sample.v};
+            double value = horizontal ? sample.dx : sample.dy;
+            for (int row = 0; row < 3; row++) {
+                for (int column = 0; column < 3; column++) {
+                    normal[row][column] += weight * feature[row] * feature[column];
+                }
+                normal[row][3] += weight * feature[row] * value;
+            }
+        }
+        double[] solved = solve3x3(normal);
+        if (solved == null) return new double[]{fallback, 0, 0};
+        double maximumSlopeX = 0.06 * PREVIEW_MAX;
+        solved[1] = Math.max(-maximumSlopeX, Math.min(maximumSlopeX, solved[1]));
+        solved[2] = Math.max(-maximumSlopeX, Math.min(maximumSlopeX, solved[2]));
+        return solved;
+    }
+
+    private double[] solve3x3(double[][] matrix) {
+        double[][] values = new double[3][4];
+        for (int row = 0; row < 3; row++) System.arraycopy(matrix[row], 0, values[row], 0, 4);
+        for (int column = 0; column < 3; column++) {
+            int pivot = column;
+            for (int row = column + 1; row < 3; row++) {
+                if (Math.abs(values[row][column]) > Math.abs(values[pivot][column])) pivot = row;
+            }
+            if (Math.abs(values[pivot][column]) < 1e-8) return null;
+            double[] swap = values[column];
+            values[column] = values[pivot];
+            values[pivot] = swap;
+            double divisor = values[column][column];
+            for (int item = column; item < 4; item++) values[column][item] /= divisor;
+            for (int row = 0; row < 3; row++) {
+                if (row == column) continue;
+                double factor = values[row][column];
+                for (int item = column; item < 4; item++) values[row][item] -= factor * values[column][item];
+            }
+        }
+        return new double[]{values[0][3], values[1][3], values[2][3]};
+    }
+
+    private double modelValue(double[] model, double u, double v) {
+        return model[0] + model[1] * u + model[2] * v;
+    }
+
+    private double medianFinite(double[] values, double fallback) {
+        double[] finite = new double[values.length];
+        int count = 0;
+        for (double value : values) if (Double.isFinite(value)) finite[count++] = value;
+        if (count == 0) return fallback;
+        java.util.Arrays.sort(finite, 0, count);
+        int middle = count / 2;
+        return count % 2 == 0 ? (finite[middle - 1] + finite[middle]) * 0.5 : finite[middle];
     }
 
     private double parabolicOffset(double left, double center, double right) {
@@ -560,7 +809,7 @@ public class MainActivity extends Activity {
         return Math.max(-0.75, Math.min(0.75, v));
     }
 
-    private double shiftCost(Bitmap a, Bitmap b, int dx, int dy, int step) {
+    private double shiftCost(Bitmap a, Bitmap b, int dx, int dy, int step, double exposureScale) {
         int w = a.getWidth(), h = a.getHeight();
         int margin = SEARCH_RADIUS + 4;
         long total = 0;
@@ -572,11 +821,11 @@ public class MainActivity extends Activity {
                 int bx = x + dx;
                 if (bx < 1 || bx >= w) continue;
                 int aCenter = luma(a.getPixel(x, y));
-                int bCenter = luma(b.getPixel(bx, by));
+                int bCenter = scaledLuma(b.getPixel(bx, by), exposureScale);
                 int aHorizontal = aCenter - luma(a.getPixel(x - 1, y));
-                int bHorizontal = bCenter - luma(b.getPixel(bx - 1, by));
+                int bHorizontal = bCenter - scaledLuma(b.getPixel(bx - 1, by), exposureScale);
                 int aVertical = aCenter - luma(a.getPixel(x, y - 1));
-                int bVertical = bCenter - luma(b.getPixel(bx, by - 1));
+                int bVertical = bCenter - scaledLuma(b.getPixel(bx, by - 1), exposureScale);
                 total += Math.abs(aHorizontal - bHorizontal);
                 total += Math.abs(aVertical - bVertical);
                 count++;
@@ -585,7 +834,7 @@ public class MainActivity extends Activity {
         return count == 0 ? Double.POSITIVE_INFINITY : (double)total / count;
     }
 
-    private double ghostFraction(Bitmap reference, Bitmap image, int dx, int dy, double exposureScale) {
+    private double ghostFraction(Bitmap reference, Bitmap image, MotionField motionField, double exposureScale) {
         Bitmap candidate = image;
         if (image.getWidth() != reference.getWidth() || image.getHeight() != reference.getHeight()) {
             candidate = Bitmap.createScaledBitmap(image, reference.getWidth(), reference.getHeight(), true);
@@ -595,12 +844,13 @@ public class MainActivity extends Activity {
         int margin = SEARCH_RADIUS + 5;
         int changed = 0;
         int samples = 0;
+        float[] candidatePoint = new float[2];
         for (int y = margin + 1; y < height - margin; y += 3) {
-            int imageY = y + dy;
-            if (imageY < 1 || imageY >= height) continue;
             for (int x = margin + 1; x < width - margin; x += 3) {
-                int imageX = x + dx;
-                if (imageX < 1 || imageX >= width) continue;
+                motionField.mapReferenceToCandidate(x, y, width, height, candidatePoint);
+                int imageX = Math.round(candidatePoint[0]);
+                int imageY = Math.round(candidatePoint[1]);
+                if (imageX < 1 || imageX >= width || imageY < 1 || imageY >= height) continue;
                 int referenceCenter = luma(reference.getPixel(x, y));
                 int imageCenter = scaledLuma(candidate.getPixel(imageX, imageY), exposureScale);
                 int referenceGradient = Math.abs(referenceCenter - luma(reference.getPixel(x - 1, y)))
@@ -637,6 +887,29 @@ public class MainActivity extends Activity {
         return values[count / 2];
     }
 
+    private double clippedFraction(Bitmap bitmap) {
+        int width = bitmap.getWidth();
+        int height = bitmap.getHeight();
+        int step = Math.max(1, Math.max(width, height) / 160);
+        int clipped = 0;
+        int count = 0;
+        for (int y = step / 2; y < height; y += step) {
+            for (int x = step / 2; x < width; x += step) {
+                int color = bitmap.getPixel(x, y);
+                if (Math.max(Color.red(color), Math.max(Color.green(color), Color.blue(color))) >= 252) {
+                    clipped++;
+                }
+                count++;
+            }
+        }
+        return count == 0 ? 1.0 : clipped / (double)count;
+    }
+
+    private double referenceScore(FrameInfo frame) {
+        double highlightWeight = Math.max(0.20, 1.0 - 5.0 * frame.clippedFraction);
+        return frame.sharpness * highlightWeight;
+    }
+
     private ColorMatrixColorFilter colorFilterFor(double scale) {
         float value = (float)scale;
         return new ColorMatrixColorFilter(new ColorMatrix(new float[]{
@@ -653,8 +926,11 @@ public class MainActivity extends Activity {
         double sharpnessWeight = Math.max(0.25, Math.min(1.0, sharpnessRatio));
         double alignmentWeight = Math.exp(-frame.alignmentCost / 24.0);
         double motionWeight = 1.0 - Math.min(1.0, frame.ghostFraction / MAX_GHOST_FRACTION);
+        double highlightWeight = Math.max(0.25, 1.0 - 3.0 * frame.clippedFraction);
+        double exposureWeight = Math.exp(-0.6 * Math.abs(Math.log(Math.max(0.01, frame.exposureScale))));
         return Math.max(0.05, Math.min(1.0,
-                sharpnessWeight * Math.max(0.10, alignmentWeight) * motionWeight));
+                sharpnessWeight * Math.max(0.10, alignmentWeight) * motionWeight
+                        * highlightWeight * exposureWeight));
     }
 
     private void validateOutputSize(int inputWidth, int inputHeight, int outputWidth, int outputHeight) {
@@ -675,36 +951,70 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void drawGhostRejectedTiles(Canvas canvas, Bitmap image, Bitmap reference, int dx, int dy,
-                                         double exposureScale, Paint paint) {
+    private void drawLocallyAlignedTiles(Canvas canvas, Bitmap image, Bitmap reference,
+                                         MotionField motionField, double exposureScale, Paint paint)
+            throws ProcessingCancelledException {
         int width = image.getWidth();
         int height = image.getHeight();
-        int[] imagePixels = new int[width * FUSION_TILE_HEIGHT];
-        int[] referenceRow = new int[width];
-        for (int top = 0; top < height; top += FUSION_TILE_HEIGHT) {
-            int tileHeight = Math.min(FUSION_TILE_HEIGHT, height - top);
-            image.getPixels(imagePixels, 0, width, 0, top, width, tileHeight);
-            for (int row = 0; row < tileHeight; row++) {
-                int y = top + row;
-                int referenceY = y - dy;
-                if (referenceY < 0 || referenceY >= height) {
-                    for (int x = 0; x < width; x++) {
-                        int index = row * width + x;
-                        int color = imagePixels[index];
-                        imagePixels[index] = Color.argb(0, Color.red(color), Color.green(color), Color.blue(color));
+        int[] imagePixels = new int[FUSION_TILE_SIZE * FUSION_TILE_SIZE];
+        int[] referencePixels = new int[0];
+        float[] mapped = new float[2];
+        float[] vertices = new float[8];
+        for (int top = 0; top < height; top += FUSION_TILE_SIZE) {
+            checkCancelled();
+            int tileHeight = Math.min(FUSION_TILE_SIZE, height - top);
+            for (int left = 0; left < width; left += FUSION_TILE_SIZE) {
+                int tileWidth = Math.min(FUSION_TILE_SIZE, width - left);
+                image.getPixels(imagePixels, 0, tileWidth, left, top, tileWidth, tileHeight);
+
+                float minReferenceX = Float.POSITIVE_INFINITY;
+                float minReferenceY = Float.POSITIVE_INFINITY;
+                float maxReferenceX = Float.NEGATIVE_INFINITY;
+                float maxReferenceY = Float.NEGATIVE_INFINITY;
+                for (int sampleY = 0; sampleY <= 2; sampleY++) {
+                    for (int sampleX = 0; sampleX <= 2; sampleX++) {
+                        float candidateX = left + tileWidth * sampleX * 0.5f;
+                        float candidateY = top + tileHeight * sampleY * 0.5f;
+                        motionField.mapCandidateToReference(candidateX, candidateY,
+                                width, height, mapped);
+                        minReferenceX = Math.min(minReferenceX, mapped[0]);
+                        minReferenceY = Math.min(minReferenceY, mapped[1]);
+                        maxReferenceX = Math.max(maxReferenceX, mapped[0]);
+                        maxReferenceY = Math.max(maxReferenceY, mapped[1]);
                     }
-                    continue;
                 }
-                reference.getPixels(referenceRow, 0, width, 0, referenceY, width, 1);
-                for (int x = 0; x < width; x++) {
-                    int referenceX = x - dx;
-                    int index = row * width + x;
-                    int color = imagePixels[index];
-                    if (referenceX < 0 || referenceX >= width) {
-                        imagePixels[index] = Color.argb(0, Color.red(color), Color.green(color), Color.blue(color));
-                        continue;
-                    }
-                    int referenceColor = referenceRow[referenceX];
+                int referenceLeft = Math.max(0, (int)Math.floor(minReferenceX) - 2);
+                int referenceTop = Math.max(0, (int)Math.floor(minReferenceY) - 2);
+                int referenceRight = Math.min(width - 1, (int)Math.ceil(maxReferenceX) + 2);
+                int referenceBottom = Math.min(height - 1, (int)Math.ceil(maxReferenceY) + 2);
+                int referenceWidth = Math.max(0, referenceRight - referenceLeft + 1);
+                int referenceHeight = Math.max(0, referenceBottom - referenceTop + 1);
+                int requiredReferencePixels = referenceWidth * referenceHeight;
+                if (referencePixels.length < requiredReferencePixels) {
+                    referencePixels = new int[requiredReferencePixels];
+                }
+                if (requiredReferencePixels > 0) {
+                    reference.getPixels(referencePixels, 0, referenceWidth, referenceLeft, referenceTop,
+                            referenceWidth, referenceHeight);
+                }
+
+                for (int row = 0; row < tileHeight; row++) {
+                    int candidateY = top + row;
+                    for (int column = 0; column < tileWidth; column++) {
+                        int candidateX = left + column;
+                        int index = row * tileWidth + column;
+                        int color = imagePixels[index];
+                        motionField.mapCandidateToReference(candidateX, candidateY,
+                                width, height, mapped);
+                        float referenceX = mapped[0];
+                        float referenceY = mapped[1];
+                        if (referenceWidth == 0 || referenceHeight == 0 || referenceX < 0
+                                || referenceX > width - 1 || referenceY < 0 || referenceY > height - 1) {
+                            imagePixels[index] = Color.argb(0, Color.red(color), Color.green(color), Color.blue(color));
+                            continue;
+                        }
+                        int referenceColor = bilinearColor(referencePixels, referenceWidth, referenceHeight,
+                                referenceX - referenceLeft, referenceY - referenceTop);
                     int referenceLuma = luma(referenceColor);
                     int candidateLuma = scaledLuma(color, exposureScale);
                     int lumaResidual = Math.abs(candidateLuma - referenceLuma);
@@ -716,13 +1026,58 @@ public class MainActivity extends Activity {
                     int difference = Math.max(lumaResidual, colorResidual / 2);
                     int threshold = PIXEL_GHOST_THRESHOLD + referenceLuma / 16;
                     int localWeight = robustPixelWeight(difference, threshold);
+                        boolean candidateClipped = Math.max(Color.red(color),
+                                Math.max(Color.green(color), Color.blue(color))) >= 252;
+                        boolean referenceClipped = Math.max(Color.red(referenceColor),
+                                Math.max(Color.green(referenceColor), Color.blue(referenceColor))) >= 252;
+                        if (candidateClipped && !referenceClipped) localWeight = 0;
                     imagePixels[index] = Color.argb(localWeight, Color.red(color), Color.green(color), Color.blue(color));
+                    }
                 }
+
+                Bitmap tile = Bitmap.createBitmap(imagePixels, 0, tileWidth,
+                        tileWidth, tileHeight, Bitmap.Config.ARGB_8888);
+                setMeshVertex(motionField, vertices, 0, left, top, width, height, mapped);
+                setMeshVertex(motionField, vertices, 2, left + tileWidth, top, width, height, mapped);
+                setMeshVertex(motionField, vertices, 4, left, top + tileHeight, width, height, mapped);
+                setMeshVertex(motionField, vertices, 6, left + tileWidth, top + tileHeight, width, height, mapped);
+                canvas.drawBitmapMesh(tile, 1, 1, vertices, 0, null, 0, paint);
+                tile.recycle();
             }
-            Bitmap tile = Bitmap.createBitmap(imagePixels, 0, width, width, tileHeight, Bitmap.Config.ARGB_8888);
-            canvas.drawBitmap(tile, 0f, top, paint);
-            tile.recycle();
         }
+    }
+
+    private void setMeshVertex(MotionField motionField, float[] vertices, int offset,
+                               float candidateX, float candidateY, int width, int height,
+                               float[] mapped) {
+        motionField.mapCandidateToReference(candidateX, candidateY, width, height, mapped);
+        vertices[offset] = mapped[0];
+        vertices[offset + 1] = mapped[1];
+    }
+
+    private int bilinearColor(int[] pixels, int width, int height, float x, float y) {
+        float safeX = Math.max(0f, Math.min(width - 1f, x));
+        float safeY = Math.max(0f, Math.min(height - 1f, y));
+        int x0 = (int)Math.floor(safeX);
+        int y0 = (int)Math.floor(safeY);
+        int x1 = Math.min(width - 1, x0 + 1);
+        int y1 = Math.min(height - 1, y0 + 1);
+        float fx = safeX - x0;
+        float fy = safeY - y0;
+        int c00 = pixels[y0 * width + x0];
+        int c10 = pixels[y0 * width + x1];
+        int c01 = pixels[y1 * width + x0];
+        int c11 = pixels[y1 * width + x1];
+        int red = bilinearChannel(Color.red(c00), Color.red(c10), Color.red(c01), Color.red(c11), fx, fy);
+        int green = bilinearChannel(Color.green(c00), Color.green(c10), Color.green(c01), Color.green(c11), fx, fy);
+        int blue = bilinearChannel(Color.blue(c00), Color.blue(c10), Color.blue(c01), Color.blue(c11), fx, fy);
+        return Color.rgb(red, green, blue);
+    }
+
+    private int bilinearChannel(int c00, int c10, int c01, int c11, float fx, float fy) {
+        float top = c00 + (c10 - c00) * fx;
+        float bottom = c01 + (c11 - c01) * fx;
+        return Math.max(0, Math.min(255, Math.round(top + (bottom - top) * fy)));
     }
 
     private int robustPixelWeight(int difference, int threshold) {
@@ -939,13 +1294,137 @@ public class MainActivity extends Activity {
         final Uri uri;
         final Bitmap preview;
         final double sharpness;
+        final double clippedFraction;
         double dxPreview;
         double dyPreview;
         double alignmentCost;
         double ghostFraction;
         double exposureScale = 1.0;
-        FrameInfo(Uri uri, Bitmap preview, double sharpness) {
-            this.uri = uri; this.preview = preview; this.sharpness = sharpness;
+        MotionField motionField;
+        FrameInfo(Uri uri, Bitmap preview, double sharpness, double clippedFraction) {
+            this.uri = uri;
+            this.preview = preview;
+            this.sharpness = sharpness;
+            this.clippedFraction = clippedFraction;
+        }
+    }
+
+    private static final class LocalShift {
+        final double dx;
+        final double dy;
+        final double cost;
+        final double texture;
+
+        LocalShift(double dx, double dy, double cost, double texture) {
+            this.dx = dx;
+            this.dy = dy;
+            this.cost = cost;
+            this.texture = texture;
+        }
+    }
+
+    private static final class MotionSample {
+        final double u;
+        final double v;
+        final double dx;
+        final double dy;
+        final double cost;
+        final double texture;
+        double robustWeight = 1.0;
+
+        MotionSample(float x, float y, int width, int height, LocalShift shift) {
+            u = (x - width * 0.5) / Math.max(1.0, width);
+            v = (y - height * 0.5) / Math.max(1.0, height);
+            dx = shift.dx;
+            dy = shift.dy;
+            cost = shift.cost;
+            texture = shift.texture;
+        }
+    }
+
+    private static final class MotionField {
+        final int previewWidth;
+        final int previewHeight;
+        final float minX;
+        final float minY;
+        final float maxX;
+        final float maxY;
+        final float[] shiftsX;
+        final float[] shiftsY;
+        final double medianCost;
+
+        MotionField(int previewWidth, int previewHeight, float minX, float minY, float maxX, float maxY,
+                    float[] shiftsX, float[] shiftsY, double medianCost) {
+            this.previewWidth = previewWidth;
+            this.previewHeight = previewHeight;
+            this.minX = minX;
+            this.minY = minY;
+            this.maxX = maxX;
+            this.maxY = maxY;
+            this.shiftsX = shiftsX;
+            this.shiftsY = shiftsY;
+            this.medianCost = medianCost;
+        }
+
+        static MotionField identity(int width, int height) {
+            return translation(width, height, 0f, 0f, 0);
+        }
+
+        static MotionField translation(int width, int height, float dx, float dy, double cost) {
+            float[] x = new float[MOTION_GRID_SIZE * MOTION_GRID_SIZE];
+            float[] y = new float[MOTION_GRID_SIZE * MOTION_GRID_SIZE];
+            java.util.Arrays.fill(x, dx);
+            java.util.Arrays.fill(y, dy);
+            return new MotionField(width, height, 0, 0,
+                    Math.max(1, width - 1), Math.max(1, height - 1), x, y, cost);
+        }
+
+        void shiftAt(float previewX, float previewY, float[] output) {
+            float gridX = (previewX - minX) / Math.max(1f, maxX - minX) * (MOTION_GRID_SIZE - 1);
+            float gridY = (previewY - minY) / Math.max(1f, maxY - minY) * (MOTION_GRID_SIZE - 1);
+            gridX = Math.max(0f, Math.min(MOTION_GRID_SIZE - 1f, gridX));
+            gridY = Math.max(0f, Math.min(MOTION_GRID_SIZE - 1f, gridY));
+            int x0 = (int)Math.floor(gridX);
+            int y0 = (int)Math.floor(gridY);
+            int x1 = Math.min(MOTION_GRID_SIZE - 1, x0 + 1);
+            int y1 = Math.min(MOTION_GRID_SIZE - 1, y0 + 1);
+            float fx = gridX - x0;
+            float fy = gridY - y0;
+            output[0] = interpolate(shiftsX, x0, y0, x1, y1, fx, fy);
+            output[1] = interpolate(shiftsY, x0, y0, x1, y1, fx, fy);
+        }
+
+        void mapReferenceToCandidate(float referenceX, float referenceY, int fullWidth, int fullHeight,
+                                     float[] output) {
+            float previewX = referenceX * previewWidth / Math.max(1f, fullWidth);
+            float previewY = referenceY * previewHeight / Math.max(1f, fullHeight);
+            shiftAt(previewX, previewY, output);
+            output[0] = referenceX + output[0] * fullWidth / Math.max(1f, previewWidth);
+            output[1] = referenceY + output[1] * fullHeight / Math.max(1f, previewHeight);
+        }
+
+        void mapCandidateToReference(float candidateX, float candidateY, int fullWidth, int fullHeight,
+                                     float[] output) {
+            float referenceX = candidateX;
+            float referenceY = candidateY;
+            for (int iteration = 0; iteration < 2; iteration++) {
+                float previewX = referenceX * previewWidth / Math.max(1f, fullWidth);
+                float previewY = referenceY * previewHeight / Math.max(1f, fullHeight);
+                shiftAt(previewX, previewY, output);
+                referenceX = candidateX - output[0] * fullWidth / Math.max(1f, previewWidth);
+                referenceY = candidateY - output[1] * fullHeight / Math.max(1f, previewHeight);
+            }
+            output[0] = referenceX;
+            output[1] = referenceY;
+        }
+
+        private static float interpolate(float[] values, int x0, int y0, int x1, int y1,
+                                         float fx, float fy) {
+            float top = values[y0 * MOTION_GRID_SIZE + x0]
+                    + (values[y0 * MOTION_GRID_SIZE + x1] - values[y0 * MOTION_GRID_SIZE + x0]) * fx;
+            float bottom = values[y1 * MOTION_GRID_SIZE + x0]
+                    + (values[y1 * MOTION_GRID_SIZE + x1] - values[y1 * MOTION_GRID_SIZE + x0]) * fx;
+            return top + (bottom - top) * fy;
         }
     }
 

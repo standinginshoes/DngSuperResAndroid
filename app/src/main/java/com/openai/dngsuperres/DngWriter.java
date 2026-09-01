@@ -31,7 +31,7 @@ final class DngWriter {
 
         byte[] make = ascii("DngSuperRes");
         byte[] model = ascii("Merged RGB burst");
-        byte[] software = ascii("DngSuperRes Android 0.6");
+        byte[] software = ascii("DngSuperRes Android 0.7");
         byte[] uniqueModel = ascii("DngSuperRes LinearRaw");
 
         int ifdEnd = 8 + 2 + ENTRY_COUNT * 12 + 4;
