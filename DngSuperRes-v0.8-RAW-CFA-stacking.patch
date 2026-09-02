@@ -1,0 +1,811 @@
+diff --git a/README.md b/README.md
+index 1ebb75a..1b35763 100644
+--- a/README.md
++++ b/README.md
+@@ -9,7 +9,7 @@ An offline Android burst processor that aligns DNG/image frames, rejects poor ma
+ - **150%:** a useful balance between denoising, detail recovery, memory, and processing time.
+ - **200%:** maximum output detail when the burst contains useful sub-pixel handheld offsets.
+ 
+-Higher resolution modes do not invent detail with a generative model. They combine differently shifted samples from the burst and interpolate the remaining output grid.
++Higher resolution modes do not invent detail with a generative model. The Bayer merge combines aligned samples from the burst at native resolution, then resamples the developed result to the selected dimensions.
+ 
+ ## Output formats
+ 
+@@ -17,9 +17,9 @@ Higher resolution modes do not invent detail with a generative model. They combi
+ - **TIFF:** uncompressed 8-bit RGB.
+ - **JPEG:** high-quality (95) compressed RGB for smaller files.
+ 
+-The DNG output is a standards-based LinearRaw DNG, not the original Bayer sensor mosaic. The merge currently works on rendered RGB frames, so exporting to 16-bit DNG preserves a lossless linear container but cannot recreate sensor precision that was discarded during 8-bit rendering.
++The DNG output is a standards-based 16-bit LinearRaw DNG containing the developed merge, not a Bayer mosaic DNG. Bayer inputs are fused before demosaic, but the current Android bitmap result is rendered to sRGB before export; TIFF and DNG are therefore lossless containers for the rendered result rather than untouched sensor samples.
+ 
+-## What v0.7 does
++## What v0.8 does
+ 
+ - Android Storage Access Framework multi-select (no broad storage permission)
+ - DNG providers with non-image MIME types are supported; bursts are capped at 30 frames
+@@ -27,6 +27,12 @@ The DNG output is a standards-based LinearRaw DNG, not the original Bayer sensor
+ - uncompressed RGB and LinearRaw DNG decoding for already-demosaiced camera output
+ - CFA-metadata detection for files with nonstandard photometric tagging
+ - disk-backed DNG input with row-sized read buffers to avoid whole-file heap allocations
++- tile-streamed Bayer CFA fusion that reads only the sensor rows required by each output stripe
++- per-frame linear-RAW exposure measurement using the DNG black and white levels
++- phase-preserving sub-pixel sampling on each Bayer color lattice before normalized fusion
++- full-resolution RAW-domain robust weights in addition to preview motion masks, reducing moving-subject ghosts
++- one edge-directed demosaic after stacking instead of demosaicing every input frame
++- automatic rendered-RGB compatibility fallback for unsupported DNG/image layouts
+ - Android large-heap mode plus runtime memory checks for full-resolution fusion
+ - black/white-level correction, Bayer demosaic, AsShotNeutral white balance, and DNG color-matrix rendering
+ - Android `ImageDecoder` support for ordinary rendered image inputs
+@@ -43,11 +49,11 @@ The DNG output is a standards-based LinearRaw DNG, not the original Bayer sensor
+ - fully local/offline processing
+ - 70 MP and device-memory safety checks with a clear suggestion to select a lower mode
+ 
+-## Important limitation
++## Important limitations
+ 
+-The app reads uncompressed Bayer DNG input directly, but it currently demosaics every frame before alignment and fusion. Its DNG export is therefore 16-bit LinearRaw RGB, not a new sensor-raw Bayer DNG. A future engine should align and merge the original CFA samples and demosaic only once after fusion. Compressed DNG variants are not yet supported by the built-in decoder.
++The RAW engine currently supports uncompressed 8–16-bit, standard 2×2 Bayer DNGs. Compressed DNGs, non-Bayer mosaics, differently sized frames, and rendered image inputs use the v0.7 RGB compatibility path. The four MotionCam-style packed 10-bit DNGs included in this project are the primary v0.8 target.
+ 
+-The next major quality step is a native, tile-streamed CFA-domain kernel-regression engine. That architecture would retain the source bit depth, merge red/green/blue Bayer samples before demosaicing, steer reconstruction kernels along local edges, and normalize accumulated sample weights. v0.7 adopts its local-alignment and robustness principles while retaining the current memory-safe rendered-RGB pipeline.
++The merge is CFA-domain and preserves normalized sensor precision internally, but its saved DNG is currently developed 16-bit LinearRaw RGB rather than a newly encoded Bayer mosaic. A future native kernel-regression/Vulkan path could reconstruct directly onto a higher-resolution grid, add lens-shading and bad-pixel metadata handling, and stream a fused Bayer DNG without the Android bitmap stage.
+ 
+ The design is informed by Google's published burst photography and handheld multi-frame super-resolution work:
+ 
+@@ -65,6 +71,6 @@ From a configured command line environment, run `./gradlew assembleDebug` from t
+ 1. Remove generated desktop build artifacts from the vendored LibRaw tree and wire a minimal Android NDK build.
+ 2. Native Bayer DNG ingest plus metadata viewer (CFA, black/white level, ISO, exposure, color matrices).
+ 3. Pyramid and tile-local motion registration for rotation, parallax, and moving subjects.
+-4. CFA-domain kernel-regression fusion with confidence weights.
+-5. 16-bit TIFF and standards-compliant DNG output.
++4. Steered kernel-regression reconstruction directly on the selected output grid.
++5. Fused Bayer DNG plus true 16-bit RGB TIFF output.
+ 6. Vulkan/GPU compute path for alignment and reconstruction.
+diff --git a/app/build.gradle b/app/build.gradle
+index 029ec02..4579e18 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -10,7 +10,7 @@ android {
+         applicationId 'com.openai.dngsuperres'
+         minSdk 28
+         targetSdk 35
+-        versionCode 7
+-        versionName '0.7.0'
++        versionCode 8
++        versionName '0.8.0'
+     }
+ }
+diff --git a/app/src/main/java/com/openai/dngsuperres/DngDecoder.java b/app/src/main/java/com/openai/dngsuperres/DngDecoder.java
+index 3b009e4..a56d851 100644
+--- a/app/src/main/java/com/openai/dngsuperres/DngDecoder.java
++++ b/app/src/main/java/com/openai/dngsuperres/DngDecoder.java
+@@ -11,6 +11,7 @@ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.RandomAccessFile;
++import java.io.Closeable;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -59,6 +60,36 @@ final class DngDecoder {
+ 
+     private DngDecoder() { }
+ 
++    static RawFrame openRaw(Context context, Uri uri) throws IOException {
++        File cachedDng = copyToCache(context.getContentResolver(), uri, context.getCacheDir());
++        RandomAccessFile file = null;
++        try {
++            file = new RandomAccessFile(cachedDng, "r");
++            Tiff tiff = new Tiff(file);
++            Ifd imageIfd = tiff.findBestImageIfd();
++            int photometric = imageIfd.intValue(TAG_PHOTOMETRIC, -1);
++            if (photometric != PHOTOMETRIC_CFA && !imageIfd.entries.containsKey(TAG_CFA_PATTERN)) {
++                throw new IOException("The selected DNG is not a Bayer CFA image.");
++            }
++            RawIfd raw = new RawIfd(imageIfd);
++            if (raw.compression != COMPRESSION_NONE) {
++                throw new IOException("RAW stacking does not yet support DNG compression " + raw.compression + ".");
++            }
++            if (raw.cfaWidth != 2 || raw.cfaHeight != 2 || raw.cfaPattern.length < 4) {
++                throw new IOException("RAW stacking requires a standard 2×2 Bayer pattern.");
++            }
++            if (raw.bitsPerSample < 8 || raw.bitsPerSample > 16) {
++                throw new IOException("RAW stacking does not support " + raw.bitsPerSample + "-bit samples.");
++            }
++            return new RawFrame(cachedDng, file, tiff.littleEndian, raw);
++        } catch (Throwable error) {
++            if (file != null) try { file.close(); } catch (IOException ignored) { }
++            if (!cachedDng.delete()) cachedDng.deleteOnExit();
++            if (error instanceof IOException) throw (IOException)error;
++            throw new IOException("Could not open Bayer data from this DNG.", error);
++        }
++    }
++
+     static Bitmap decode(Context context, Uri uri, int maxDimension) throws IOException {
+         File cachedDng = copyToCache(context.getContentResolver(), uri, context.getCacheDir());
+         try (RandomAccessFile file = new RandomAccessFile(cachedDng, "r")) {
+@@ -365,6 +396,132 @@ final class DngDecoder {
+         };
+     }
+ 
++    static final class RawFrame implements Closeable {
++        final int width;
++        final int height;
++        final int bitsPerSample;
++        final int cfaWidth;
++        final int cfaHeight;
++        final int[] cfaPattern;
++        final float[] asShotNeutral;
++        final float[] cameraToXyz;
++        final float[] rgbMatrix;
++        private final File cachedDng;
++        private final RandomAccessFile file;
++        private final boolean littleEndian;
++        private final RawIfd raw;
++        private final int rowBytes;
++        private final byte[] packedRow;
++        private boolean closed;
++
++        RawFrame(File cachedDng, RandomAccessFile file, boolean littleEndian, RawIfd raw)
++                throws IOException {
++            this.cachedDng = cachedDng;
++            this.file = file;
++            this.littleEndian = littleEndian;
++            this.raw = raw;
++            width = raw.width;
++            height = raw.height;
++            bitsPerSample = raw.bitsPerSample;
++            cfaWidth = raw.cfaWidth;
++            cfaHeight = raw.cfaHeight;
++            cfaPattern = raw.cfaPattern.clone();
++            asShotNeutral = raw.asShotNeutral.clone();
++            cameraToXyz = raw.cameraToXyz.clone();
++            rgbMatrix = multiply3x3(XYZ_D50_TO_SRGB, cameraToXyz);
++            long bytes = ((long)width * bitsPerSample + 7L) / 8L;
++            if (bytes <= 0 || bytes > Integer.MAX_VALUE) throw new IOException("RAW DNG row is too large.");
++            rowBytes = (int)bytes;
++            packedRow = new byte[rowBytes];
++        }
++
++        synchronized short[] readRows(int firstRow, int rowCount) throws IOException {
++            if (closed) throw new IOException("RAW DNG reader is closed.");
++            if (firstRow < 0 || rowCount < 0 || firstRow + rowCount > height) {
++                throw new IOException("Requested RAW rows are outside the image.");
++            }
++            long samples = (long)width * rowCount;
++            if (samples > Integer.MAX_VALUE) throw new IOException("Requested RAW stripe is too large.");
++            short[] output = new short[(int)samples];
++            for (int localY = 0; localY < rowCount; localY++) {
++                int sourceY = firstRow + localY;
++                int strip = Math.min(raw.stripOffsets.length - 1, sourceY / raw.rowsPerStrip);
++                int rowInStrip = sourceY - strip * raw.rowsPerStrip;
++                long rowOffset = raw.stripOffsets[strip] + (long)rowInStrip * rowBytes;
++                if (rowOffset < 0 || rowOffset + rowBytes > file.length()) {
++                    throw new IOException("RAW DNG pixel strip is truncated.");
++                }
++                file.seek(rowOffset);
++                file.readFully(packedRow);
++                unpackRow(packedRow, output, localY * width);
++            }
++            return output;
++        }
++
++        int cfaColor(int x, int y) {
++            return cfaPattern[Math.floorMod(y, cfaHeight) * cfaWidth + Math.floorMod(x, cfaWidth)];
++        }
++
++        float normalized(int value, int x, int y) {
++            int blackIndex = Math.floorMod(y, raw.blackHeight) * raw.blackWidth
++                    + Math.floorMod(x, raw.blackWidth);
++            float black = raw.blackLevel[Math.min(blackIndex, raw.blackLevel.length - 1)];
++            return Math.max(0f, Math.min(1f,
++                    (value - black) / Math.max(1f, raw.whiteLevel - black)));
++        }
++
++        int renderSrgb(float red, float green, float blue) {
++            float redBalance = asShotNeutral.length >= 3 && asShotNeutral[0] > 0f
++                    ? asShotNeutral[1] / asShotNeutral[0] : 1f;
++            float blueBalance = asShotNeutral.length >= 3 && asShotNeutral[2] > 0f
++                    ? asShotNeutral[1] / asShotNeutral[2] : 1f;
++            red *= redBalance;
++            blue *= blueBalance;
++            float linearRed = rgbMatrix[0] * red + rgbMatrix[1] * green + rgbMatrix[2] * blue;
++            float linearGreen = rgbMatrix[3] * red + rgbMatrix[4] * green + rgbMatrix[5] * blue;
++            float linearBlue = rgbMatrix[6] * red + rgbMatrix[7] * green + rgbMatrix[8] * blue;
++            return Color.rgb(toSrgb8(linearRed), toSrgb8(linearGreen), toSrgb8(linearBlue));
++        }
++
++        private void unpackRow(byte[] source, short[] destination, int destinationOffset) throws IOException {
++            if (bitsPerSample == 16) {
++                for (int x = 0; x < width; x++) {
++                    int offset = x * 2;
++                    int value = littleEndian
++                            ? (source[offset] & 255) | ((source[offset + 1] & 255) << 8)
++                            : ((source[offset] & 255) << 8) | (source[offset + 1] & 255);
++                    destination[destinationOffset + x] = (short)value;
++                }
++            } else if (bitsPerSample == 8) {
++                for (int x = 0; x < width; x++) destination[destinationOffset + x] = (short)(source[x] & 255);
++            } else {
++                int mask = (1 << bitsPerSample) - 1;
++                for (int x = 0; x < width; x++) {
++                    int bit = x * bitsPerSample;
++                    int offset = bit >>> 3;
++                    int bitInByte = bit & 7;
++                    int packed = (source[offset] & 255) << 16;
++                    if (offset + 1 < rowBytes) packed |= (source[offset + 1] & 255) << 8;
++                    if (offset + 2 < rowBytes) packed |= source[offset + 2] & 255;
++                    int shift = 24 - bitInByte - bitsPerSample;
++                    if (shift < 0) throw new IOException("Unsupported packed RAW row alignment.");
++                    destination[destinationOffset + x] = (short)((packed >>> shift) & mask);
++                }
++            }
++        }
++
++        @Override
++        public synchronized void close() throws IOException {
++            if (closed) return;
++            closed = true;
++            try {
++                file.close();
++            } finally {
++                if (!cachedDng.delete()) cachedDng.deleteOnExit();
++            }
++        }
++    }
++
+     private static final class RgbIfd {
+         final int width;
+         final int height;
+diff --git a/app/src/main/java/com/openai/dngsuperres/DngWriter.java b/app/src/main/java/com/openai/dngsuperres/DngWriter.java
+index 5e9048f..0547cdc 100644
+--- a/app/src/main/java/com/openai/dngsuperres/DngWriter.java
++++ b/app/src/main/java/com/openai/dngsuperres/DngWriter.java
+@@ -31,7 +31,7 @@ final class DngWriter {
+ 
+         byte[] make = ascii("DngSuperRes");
+         byte[] model = ascii("Merged RGB burst");
+-        byte[] software = ascii("DngSuperRes Android 0.7");
++        byte[] software = ascii("DngSuperRes Android 0.8");
+         byte[] uniqueModel = ascii("DngSuperRes LinearRaw");
+ 
+         int ifdEnd = 8 + 2 + ENTRY_COUNT * 12 + 4;
+diff --git a/app/src/main/java/com/openai/dngsuperres/MainActivity.java b/app/src/main/java/com/openai/dngsuperres/MainActivity.java
+index 23d372e..55e07b0 100644
+--- a/app/src/main/java/com/openai/dngsuperres/MainActivity.java
++++ b/app/src/main/java/com/openai/dngsuperres/MainActivity.java
+@@ -46,6 +46,7 @@ public class MainActivity extends Activity {
+     private static final double MAX_GHOST_FRACTION = 0.22;
+     private static final int PIXEL_GHOST_THRESHOLD = 14;
+     private static final int FUSION_TILE_SIZE = 512;
++    private static final int RAW_MERGE_STRIPE_ROWS = 64;
+     private static final long MAX_OUTPUT_PIXELS = 70_000_000L;
+     private static final int OUTPUT_SCALE_STEPS = 20;
+     private static final float OUTPUT_SCALE_STEP = 0.05f;
+@@ -91,7 +92,7 @@ public class MainActivity extends Activity {
+         root.addView(title);
+ 
+         TextView subtitle = new TextView(this);
+-        subtitle.setText("Offline local-motion denoise + super resolution • v0.7");
++        subtitle.setText("Offline Bayer-domain stacking + super resolution • v0.8");
+         subtitle.setTextSize(15);
+         subtitle.setTextColor(Color.DKGRAY);
+         subtitle.setPadding(0, 0, 0, dp(18));
+@@ -135,7 +136,7 @@ public class MainActivity extends Activity {
+         updateProcessButtonLabel();
+ 
+         TextView resolutionHint = new TextView(this);
+-        resolutionHint.setText("Choose any size from 100% to 200% in 5% steps. 100% keeps the original dimensions; larger sizes use sub-pixel burst offsets to recover detail.");
++        resolutionHint.setText("Choose any size from 100% to 200% in 5% steps. 100% performs the strongest native RAW merge; larger sizes preserve its detail in a larger output.");
+         resolutionHint.setTextSize(13);
+         resolutionHint.setTextColor(Color.DKGRAY);
+         resolutionHint.setPadding(0, dp(4), 0, dp(10));
+@@ -359,22 +360,6 @@ public class MainActivity extends Activity {
+                     updateProgress(20 + (int)(30.0 * (i + 1) / info.size()), "Aligned " + (i + 1) + "/" + info.size());
+                 }
+ 
+-                refFull = decodeFull(ref.uri);
+-                if (refFull == null) throw new IllegalStateException("Reference DNG could not be decoded at full resolution.");
+-                int w = refFull.getWidth();
+-                int h = refFull.getHeight();
+-                int outputWidth = Math.round(w * outputScale);
+-                int outputHeight = Math.round(h * outputScale);
+-                validateOutputSize(w, h, outputWidth, outputHeight);
+-                try {
+-                    out = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888);
+-                } catch (OutOfMemoryError e) {
+-                    throw new IllegalStateException("Not enough memory for the " + outputWidth + "×" + outputHeight
+-                            + " output. Choose a lower output resolution.", e);
+-                }
+-                Canvas canvas = new Canvas(out);
+-                Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
+-
+                 ArrayList<FrameInfo> ordered = new ArrayList<>();
+                 ordered.add(ref);
+                 double[] costs = new double[Math.max(0, info.size() - 1)];
+@@ -400,6 +385,29 @@ public class MainActivity extends Activity {
+                 runOnUiThread(() -> status.setText("Stacking " + ordered.size() + " frames" +
+                         (rejectedCount == 0 ? "" : " • rejected " + rejectedCount + " poor matches")));
+ 
++                out = tryRawCfaFusion(ordered, ref, outputScale);
++                if (out != null) {
++                    publishCompleted(out, outputScale, ordered.size(), "RAW CFA");
++                    return;
++                }
++                runOnUiThread(() -> status.setText("Using rendered-RGB compatibility fusion…"));
++
++                refFull = decodeFull(ref.uri);
++                if (refFull == null) throw new IllegalStateException("Reference DNG could not be decoded at full resolution.");
++                int w = refFull.getWidth();
++                int h = refFull.getHeight();
++                int outputWidth = Math.round(w * outputScale);
++                int outputHeight = Math.round(h * outputScale);
++                validateOutputSize(w, h, outputWidth, outputHeight);
++                try {
++                    out = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888);
++                } catch (OutOfMemoryError e) {
++                    throw new IllegalStateException("Not enough memory for the " + outputWidth + "×" + outputHeight
++                            + " output. Choose a lower output resolution.", e);
++                }
++                Canvas canvas = new Canvas(out);
++                Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
++
+                 double totalWeight = 0.0;
+                 for (int i = 0; i < ordered.size(); i++) {
+                     checkCancelled();
+@@ -431,21 +439,7 @@ public class MainActivity extends Activity {
+                     updateProgress(50 + (int)(48.0 * (i + 1) / ordered.size()), "Stacking " + (i + 1) + "/" + ordered.size());
+                 }
+ 
+-                Bitmap completed = out;
+-                resultBitmap = completed;
+-                resultOutputScale = outputScale;
+-                runOnUiThread(() -> {
+-                    progress.setProgress(100);
+-                    status.setText("Done • " + completed.getWidth() + "×" + completed.getHeight() + " • " + ordered.size() + " frames");
+-                    resultPreview = makeDisplayPreview(completed);
+-                    previewImage.setImageBitmap(resultPreview);
+-                    processButton.setEnabled(true);
+-                    selectButton.setEnabled(true);
+-                    resolutionSeekBar.setEnabled(true);
+-                    formatSpinner.setEnabled(true);
+-                    cancelButton.setEnabled(false);
+-                    saveButton.setEnabled(true);
+-                });
++                publishCompleted(out, outputScale, ordered.size(), "RGB fallback");
+             } catch (Throwable t) {
+                 runOnUiThread(() -> {
+                     String errorMessage = friendlyError(t);
+@@ -506,6 +500,405 @@ public class MainActivity extends Activity {
+         }
+     }
+ 
++    /**
++     * Attempts a true sensor-domain merge. Inputs which are not compatible uncompressed Bayer
++     * DNGs return null so the established rendered-RGB path can still handle them.
++     */
++    private Bitmap tryRawCfaFusion(List<FrameInfo> ordered, FrameInfo reference, float outputScale)
++            throws Exception {
++        ArrayList<DngDecoder.RawFrame> rawFrames = new ArrayList<>(ordered.size());
++        try {
++            updateProgress(50, "Opening original Bayer samples…");
++            try {
++                for (FrameInfo frame : ordered) {
++                    checkCancelled();
++                    rawFrames.add(DngDecoder.openRaw(getApplicationContext(), frame.uri));
++                }
++            } catch (IOException unsupportedRaw) {
++                return null;
++            }
++
++            DngDecoder.RawFrame referenceRaw = rawFrames.get(0);
++            int width = referenceRaw.width;
++            int height = referenceRaw.height;
++            for (DngDecoder.RawFrame raw : rawFrames) {
++                if (raw.width != width || raw.height != height || raw.cfaWidth != 2
++                        || raw.cfaHeight != 2) return null;
++            }
++            validateRawOutputSize(width, height, Math.round(width * outputScale),
++                    Math.round(height * outputScale));
++
++            double referenceMedian = rawMedian(referenceRaw);
++            for (int i = 0; i < ordered.size(); i++) {
++                FrameInfo frame = ordered.get(i);
++                frame.rawExposureScale = i == 0 ? 1.0 : Math.max(0.5, Math.min(2.0,
++                        referenceMedian / Math.max(0.0001, rawMedian(rawFrames.get(i)))));
++                frame.rawConfidence = buildRawConfidence(frame, reference);
++            }
++
++            final int pixelCount;
++            try {
++                pixelCount = Math.multiplyExact(width, height);
++            } catch (ArithmeticException tooLarge) {
++                throw new IllegalStateException("The RAW image dimensions are too large.", tooLarge);
++            }
++            short[] merged;
++            try {
++                merged = new short[pixelCount];
++            } catch (OutOfMemoryError memoryError) {
++                throw new IllegalStateException("Not enough memory for the Bayer merge. Choose fewer frames or restart the app.",
++                        memoryError);
++            }
++
++            int stripeCapacity = Math.multiplyExact(width, RAW_MERGE_STRIPE_ROWS);
++            float[] sums = new float[stripeCapacity];
++            float[] weights = new float[stripeCapacity];
++            float[] referenceSamples = new float[stripeCapacity];
++            float[] candidatePoint = new float[2];
++            for (int top = 0; top < height; top += RAW_MERGE_STRIPE_ROWS) {
++                checkCancelled();
++                int stripeHeight = Math.min(RAW_MERGE_STRIPE_ROWS, height - top);
++                int stripePixels = width * stripeHeight;
++                java.util.Arrays.fill(sums, 0, stripePixels, 0f);
++                java.util.Arrays.fill(weights, 0, stripePixels, 0f);
++                java.util.Arrays.fill(referenceSamples, 0, stripePixels, 0f);
++
++                for (int frameIndex = 0; frameIndex < ordered.size(); frameIndex++) {
++                    checkCancelled();
++                    FrameInfo frame = ordered.get(frameIndex);
++                    DngDecoder.RawFrame raw = rawFrames.get(frameIndex);
++                    float fullScaleY = height / Math.max(1f, frame.motionField.previewHeight);
++                    int firstRow = Math.max(0, (int)Math.floor(top
++                            + frame.motionField.minimumShiftY() * fullScaleY) - 4);
++                    int lastRow = Math.min(height - 1, (int)Math.ceil(top + stripeHeight - 1
++                            + frame.motionField.maximumShiftY() * fullScaleY) + 4);
++                    if (lastRow < firstRow) continue;
++                    short[] sourceRows = raw.readRows(firstRow, lastRow - firstRow + 1);
++                    float globalWeight = (float)qualityWeight(frame, reference);
++
++                    for (int localY = 0; localY < stripeHeight; localY++) {
++                        int referenceY = top + localY;
++                        int confidenceWidth = reference.preview.getWidth();
++                        int confidenceHeight = reference.preview.getHeight();
++                        int previewY = Math.min(confidenceHeight - 1,
++                                referenceY * confidenceHeight / Math.max(1, height));
++                        for (int referenceX = 0; referenceX < width; referenceX++) {
++                            int outputIndex = localY * width + referenceX;
++                            int previewX = Math.min(confidenceWidth - 1,
++                                    referenceX * confidenceWidth / Math.max(1, width));
++                            float confidence = (frame.rawConfidence[previewY * confidenceWidth
++                                    + previewX] & 255) / 255f;
++                            if (confidence <= 0f) continue;
++
++                            frame.motionField.mapReferenceToCandidate(referenceX, referenceY,
++                                    width, height, candidatePoint);
++                            if (candidatePoint[0] < -1f || candidatePoint[0] > width
++                                    || candidatePoint[1] < -1f || candidatePoint[1] > height) continue;
++                            int phaseX = Math.floorMod(referenceX, referenceRaw.cfaWidth);
++                            int phaseY = Math.floorMod(referenceY, referenceRaw.cfaHeight);
++                            int wantedColor = referenceRaw.cfaColor(referenceX, referenceY);
++                            int phase = matchingCfaPhase(raw, wantedColor, phaseX, phaseY);
++                            float sample = sampleRawPhase(raw, sourceRows, firstRow,
++                                    candidatePoint[0], candidatePoint[1], phase & 0xffff, phase >>> 16);
++                            if (!Float.isFinite(sample)) continue;
++                            if (frameIndex > 0 && sample >= 0.995f) continue;
++                            sample = Math.max(0f, Math.min(1f,
++                                    sample * (float)frame.rawExposureScale));
++                            if (frameIndex == 0) referenceSamples[outputIndex] = sample;
++                            float rawWeight = frameIndex == 0 ? 1f
++                                    : rawRobustWeight(Math.abs(sample - referenceSamples[outputIndex]),
++                                            referenceSamples[outputIndex]);
++                            float weight = globalWeight * confidence * rawWeight;
++                            if (weight <= 0f) continue;
++                            sums[outputIndex] += sample * weight;
++                            weights[outputIndex] += weight;
++                        }
++                    }
++                }
++
++                for (int i = 0; i < stripePixels; i++) {
++                    float value = weights[i] > 0f ? sums[i] / weights[i] : 0f;
++                    merged[top * width + i] = (short)Math.max(0, Math.min(65535,
++                            Math.round(value * 65535f)));
++                }
++                int progressValue = 54 + (int)(28.0 * (top + stripeHeight) / height);
++                updateProgress(progressValue, "Fusing Bayer rows " + (top + stripeHeight)
++                        + "/" + height + "…");
++            }
++
++            return renderMergedRaw(referenceRaw, merged, outputScale);
++        } finally {
++            for (DngDecoder.RawFrame raw : rawFrames) {
++                try { raw.close(); } catch (IOException ignored) { }
++            }
++        }
++    }
++
++    private double rawMedian(DngDecoder.RawFrame raw) throws IOException, ProcessingCancelledException {
++        float[] samples = new float[1024];
++        int count = 0;
++        for (int sampleRow = 0; sampleRow < 32 && count < samples.length; sampleRow++) {
++            checkCancelled();
++            int y = Math.min(raw.height - 1,
++                    Math.round((sampleRow + 0.5f) * raw.height / 32f));
++            short[] row = raw.readRows(y, 1);
++            for (int sampleColumn = 0; sampleColumn < 32 && count < samples.length; sampleColumn++) {
++                int x = Math.min(raw.width - 1,
++                        Math.round((sampleColumn + 0.5f) * raw.width / 32f));
++                samples[count++] = raw.normalized(row[x] & 0xffff, x, y);
++            }
++        }
++        java.util.Arrays.sort(samples, 0, count);
++        return count == 0 ? 0.1 : samples[count / 2];
++    }
++
++    private byte[] buildRawConfidence(FrameInfo frame, FrameInfo reference) {
++        int width = reference.preview.getWidth();
++        int height = reference.preview.getHeight();
++        byte[] confidence = new byte[width * height];
++        if (frame == reference) {
++            java.util.Arrays.fill(confidence, (byte)255);
++            return confidence;
++        }
++
++        Bitmap candidate = frame.preview;
++        if (candidate.getWidth() != width || candidate.getHeight() != height) {
++            candidate = Bitmap.createScaledBitmap(candidate, width, height, true);
++        }
++        int[] referencePixels = new int[width * height];
++        int[] candidatePixels = new int[width * height];
++        reference.preview.getPixels(referencePixels, 0, width, 0, 0, width, height);
++        candidate.getPixels(candidatePixels, 0, width, 0, 0, width, height);
++        float[] mapped = new float[2];
++        for (int y = 0; y < height; y++) {
++            for (int x = 0; x < width; x++) {
++                frame.motionField.mapReferenceToCandidate(x, y, width, height, mapped);
++                int candidateX = Math.round(mapped[0]);
++                int candidateY = Math.round(mapped[1]);
++                if (candidateX < 0 || candidateX >= width || candidateY < 0 || candidateY >= height) {
++                    confidence[y * width + x] = 0;
++                    continue;
++                }
++                int referenceColor = referencePixels[y * width + x];
++                int candidateColor = candidatePixels[candidateY * width + candidateX];
++                int referenceLuma = luma(referenceColor);
++                int lumaResidual = Math.abs(scaledLuma(candidateColor, frame.exposureScale)
++                        - referenceLuma);
++                int colorResidual = Math.max(
++                        Math.abs(scaleChannel(Color.red(candidateColor), frame.exposureScale)
++                                - Color.red(referenceColor)),
++                        Math.max(Math.abs(scaleChannel(Color.green(candidateColor), frame.exposureScale)
++                                        - Color.green(referenceColor)),
++                                Math.abs(scaleChannel(Color.blue(candidateColor), frame.exposureScale)
++                                        - Color.blue(referenceColor))));
++                int localWeight = robustPixelWeight(Math.max(lumaResidual, colorResidual / 2),
++                        PIXEL_GHOST_THRESHOLD + referenceLuma / 16);
++                boolean candidateClipped = Math.max(Color.red(candidateColor),
++                        Math.max(Color.green(candidateColor), Color.blue(candidateColor))) >= 252;
++                boolean referenceClipped = Math.max(Color.red(referenceColor),
++                        Math.max(Color.green(referenceColor), Color.blue(referenceColor))) >= 252;
++                if (candidateClipped && !referenceClipped) localWeight = 0;
++                confidence[y * width + x] = (byte)localWeight;
++            }
++        }
++        if (candidate != frame.preview) candidate.recycle();
++        return confidence;
++    }
++
++    private int matchingCfaPhase(DngDecoder.RawFrame raw, int wantedColor,
++                                 int preferredX, int preferredY) {
++        if (raw.cfaColor(preferredX, preferredY) == wantedColor) {
++            return preferredX | (preferredY << 16);
++        }
++        for (int y = 0; y < raw.cfaHeight; y++) {
++            for (int x = 0; x < raw.cfaWidth; x++) {
++                if (raw.cfaColor(x, y) == wantedColor) return x | (y << 16);
++            }
++        }
++        return preferredX | (preferredY << 16);
++    }
++
++    private float sampleRawPhase(DngDecoder.RawFrame raw, short[] rows, int firstRow,
++                                 float x, float y, int phaseX, int phaseY) {
++        float latticeX = (x - phaseX) / raw.cfaWidth;
++        float latticeY = (y - phaseY) / raw.cfaHeight;
++        int maxLatticeX = Math.max(0, (raw.width - 1 - phaseX) / raw.cfaWidth);
++        int maxLatticeY = Math.max(0, (raw.height - 1 - phaseY) / raw.cfaHeight);
++        int x0Index = Math.max(0, Math.min(maxLatticeX, (int)Math.floor(latticeX)));
++        int y0Index = Math.max(0, Math.min(maxLatticeY, (int)Math.floor(latticeY)));
++        int x1Index = Math.min(maxLatticeX, x0Index + 1);
++        int y1Index = Math.min(maxLatticeY, y0Index + 1);
++        float fx = Math.max(0f, Math.min(1f, latticeX - x0Index));
++        float fy = Math.max(0f, Math.min(1f, latticeY - y0Index));
++        int x0 = phaseX + x0Index * raw.cfaWidth;
++        int x1 = phaseX + x1Index * raw.cfaWidth;
++        int y0 = phaseY + y0Index * raw.cfaHeight;
++        int y1 = phaseY + y1Index * raw.cfaHeight;
++        if (y0 < firstRow || y1 >= firstRow + rows.length / raw.width) return Float.NaN;
++        float s00 = raw.normalized(rows[(y0 - firstRow) * raw.width + x0] & 0xffff, x0, y0);
++        float s10 = raw.normalized(rows[(y0 - firstRow) * raw.width + x1] & 0xffff, x1, y0);
++        float s01 = raw.normalized(rows[(y1 - firstRow) * raw.width + x0] & 0xffff, x0, y1);
++        float s11 = raw.normalized(rows[(y1 - firstRow) * raw.width + x1] & 0xffff, x1, y1);
++        float top = s00 + (s10 - s00) * fx;
++        float bottom = s01 + (s11 - s01) * fx;
++        return top + (bottom - top) * fy;
++    }
++
++    private float rawRobustWeight(float residual, float referenceValue) {
++        float threshold = 0.025f + 0.08f * (float)Math.sqrt(Math.max(0f, referenceValue));
++        if (residual <= threshold) return 1f;
++        float normalized = (residual - threshold) / threshold;
++        if (normalized >= 1f) return 0f;
++        float shoulder = 1f - normalized * normalized;
++        return shoulder * shoulder;
++    }
++
++    private Bitmap renderMergedRaw(DngDecoder.RawFrame raw, short[] merged, float outputScale)
++            throws ProcessingCancelledException {
++        updateProgress(83, "Demosaicing merged Bayer image once…");
++        Bitmap nativeOutput;
++        try {
++            nativeOutput = Bitmap.createBitmap(raw.width, raw.height, Bitmap.Config.ARGB_8888);
++        } catch (OutOfMemoryError memoryError) {
++            throw new IllegalStateException("Not enough memory to render the merged RAW image.", memoryError);
++        }
++        int[] outputRow = new int[raw.width];
++        float[] rgb = new float[3];
++        for (int y = 0; y < raw.height; y++) {
++            if ((y & 31) == 0) {
++                checkCancelled();
++                updateProgress(83 + (int)(14.0 * y / raw.height),
++                        "Developing merged RAW " + y + "/" + raw.height + "…");
++            }
++            for (int x = 0; x < raw.width; x++) {
++                demosaicPixel(raw, merged, x, y, rgb);
++                outputRow[x] = raw.renderSrgb(rgb[0], rgb[1], rgb[2]);
++            }
++            nativeOutput.setPixels(outputRow, 0, raw.width, 0, y, raw.width, 1);
++        }
++
++        int outputWidth = Math.max(1, Math.round(raw.width * outputScale));
++        int outputHeight = Math.max(1, Math.round(raw.height * outputScale));
++        if (outputWidth == raw.width && outputHeight == raw.height) return nativeOutput;
++        updateProgress(98, "Resampling final output…");
++        try {
++            Bitmap scaled = Bitmap.createScaledBitmap(nativeOutput, outputWidth, outputHeight, true);
++            nativeOutput.recycle();
++            return scaled;
++        } catch (OutOfMemoryError memoryError) {
++            nativeOutput.recycle();
++            throw new IllegalStateException("Not enough memory for the selected output size. Choose a lower resolution.",
++                    memoryError);
++        }
++    }
++
++    /** Lightweight edge-directed Bayer demosaic; all color development occurs after fusion. */
++    private void demosaicPixel(DngDecoder.RawFrame raw, short[] mosaic, int x, int y,
++                               float[] output) {
++        int centerColor = raw.cfaColor(x, y);
++        float center = mergedValue(mosaic, raw.width, raw.height, x, y);
++        float red;
++        float green;
++        float blue;
++        if (centerColor == 0 || centerColor == 2) {
++            float left = mergedValue(mosaic, raw.width, raw.height, x - 1, y);
++            float right = mergedValue(mosaic, raw.width, raw.height, x + 1, y);
++            float up = mergedValue(mosaic, raw.width, raw.height, x, y - 1);
++            float down = mergedValue(mosaic, raw.width, raw.height, x, y + 1);
++            float sameLeft = mergedValue(mosaic, raw.width, raw.height, x - 2, y);
++            float sameRight = mergedValue(mosaic, raw.width, raw.height, x + 2, y);
++            float sameUp = mergedValue(mosaic, raw.width, raw.height, x, y - 2);
++            float sameDown = mergedValue(mosaic, raw.width, raw.height, x, y + 2);
++            float horizontal = 0.5f * (left + right) + 0.25f * (2f * center - sameLeft - sameRight);
++            float vertical = 0.5f * (up + down) + 0.25f * (2f * center - sameUp - sameDown);
++            float horizontalGradient = Math.abs(left - right) + Math.abs(2f * center - sameLeft - sameRight);
++            float verticalGradient = Math.abs(up - down) + Math.abs(2f * center - sameUp - sameDown);
++            green = clamp01(horizontalGradient < verticalGradient ? horizontal
++                    : verticalGradient < horizontalGradient ? vertical : 0.5f * (horizontal + vertical));
++            float diagonalA = 0.5f * (mergedValue(mosaic, raw.width, raw.height, x - 1, y - 1)
++                    + mergedValue(mosaic, raw.width, raw.height, x + 1, y + 1));
++            float diagonalB = 0.5f * (mergedValue(mosaic, raw.width, raw.height, x + 1, y - 1)
++                    + mergedValue(mosaic, raw.width, raw.height, x - 1, y + 1));
++            float gradientA = Math.abs(mergedValue(mosaic, raw.width, raw.height, x - 1, y - 1)
++                    - mergedValue(mosaic, raw.width, raw.height, x + 1, y + 1));
++            float gradientB = Math.abs(mergedValue(mosaic, raw.width, raw.height, x + 1, y - 1)
++                    - mergedValue(mosaic, raw.width, raw.height, x - 1, y + 1));
++            float opposite = gradientA < gradientB ? diagonalA
++                    : gradientB < gradientA ? diagonalB : 0.5f * (diagonalA + diagonalB);
++            if (centerColor == 0) {
++                red = center;
++                blue = opposite;
++            } else {
++                red = opposite;
++                blue = center;
++            }
++        } else {
++            green = center;
++            boolean redHorizontal = raw.cfaColor(x - 1, y) == 0 || raw.cfaColor(x + 1, y) == 0;
++            float horizontal = 0.5f * (mergedValue(mosaic, raw.width, raw.height, x - 1, y)
++                    + mergedValue(mosaic, raw.width, raw.height, x + 1, y));
++            float vertical = 0.5f * (mergedValue(mosaic, raw.width, raw.height, x, y - 1)
++                    + mergedValue(mosaic, raw.width, raw.height, x, y + 1));
++            red = redHorizontal ? horizontal : vertical;
++            blue = redHorizontal ? vertical : horizontal;
++        }
++        output[0] = clamp01(red);
++        output[1] = clamp01(green);
++        output[2] = clamp01(blue);
++    }
++
++    private float mergedValue(short[] mosaic, int width, int height, int x, int y) {
++        int safeX = Math.max(0, Math.min(width - 1, x));
++        int safeY = Math.max(0, Math.min(height - 1, y));
++        return (mosaic[safeY * width + safeX] & 0xffff) / 65535f;
++    }
++
++    private float clamp01(float value) {
++        return Math.max(0f, Math.min(1f, value));
++    }
++
++    private void validateRawOutputSize(int inputWidth, int inputHeight,
++                                       int outputWidth, int outputHeight) {
++        long inputPixels = (long)inputWidth * inputHeight;
++        long outputPixels = (long)outputWidth * outputHeight;
++        if (outputPixels <= 0 || outputPixels > MAX_OUTPUT_PIXELS) {
++            throw new IllegalStateException("The selected mode would create " + outputWidth + "×" + outputHeight
++                    + ". Choose a lower resolution; the safety limit is 70 MP.");
++        }
++        long previewBytes = (long)PREVIEW_MAX * PREVIEW_MAX * 4L * Math.min(frames.size(), MAX_FRAMES);
++        long nativeBitmapBytes = inputPixels * 4L;
++        long scaledBitmapBytes = outputPixels == inputPixels ? 0L : outputPixels * 4L;
++        long rawMergeBytes = inputPixels * 2L;
++        long stripeBytes = (long)inputWidth * RAW_MERGE_STRIPE_ROWS * 16L;
++        long estimatedBytes = nativeBitmapBytes + scaledBitmapBytes + rawMergeBytes + stripeBytes
++                + previewBytes + 24L * 1024L * 1024L;
++        long safeBudget = Runtime.getRuntime().maxMemory() * 85L / 100L;
++        if (estimatedBytes > safeBudget) {
++            throw new IllegalStateException("RAW fusion at this size needs about "
++                    + (estimatedBytes / (1024L * 1024L)) + " MB while this device allows about "
++                    + (safeBudget / (1024L * 1024L)) + " MB safely. Choose a lower output resolution.");
++        }
++    }
++
++    private void publishCompleted(Bitmap completed, float outputScale, int frameCount, String engine) {
++        resultBitmap = completed;
++        resultOutputScale = outputScale;
++        Bitmap display = makeDisplayPreview(completed);
++        resultPreview = display;
++        runOnUiThread(() -> {
++            progress.setProgress(100);
++            status.setText("Done • " + completed.getWidth() + "×" + completed.getHeight()
++                    + " • " + frameCount + " frames • " + engine);
++            previewImage.setImageBitmap(display);
++            processButton.setEnabled(true);
++            selectButton.setEnabled(true);
++            resolutionSeekBar.setEnabled(true);
++            formatSpinner.setEnabled(true);
++            cancelButton.setEnabled(false);
++            saveButton.setEnabled(true);
++        });
++    }
++
+     private double sharpness(Bitmap b) {
+         int w = b.getWidth(), h = b.getHeight();
+         int step = 2;
+@@ -1300,6 +1693,8 @@ public class MainActivity extends Activity {
+         double alignmentCost;
+         double ghostFraction;
+         double exposureScale = 1.0;
++        double rawExposureScale = 1.0;
++        byte[] rawConfidence;
+         MotionField motionField;
+         FrameInfo(Uri uri, Bitmap preview, double sharpness, double clippedFraction) {
+             this.uri = uri;
+@@ -1418,6 +1813,18 @@ public class MainActivity extends Activity {
+             output[1] = referenceY;
+         }
+ 
++        float minimumShiftY() {
++            float value = Float.POSITIVE_INFINITY;
++            for (float shift : shiftsY) value = Math.min(value, shift);
++            return value;
++        }
++
++        float maximumShiftY() {
++            float value = Float.NEGATIVE_INFINITY;
++            for (float shift : shiftsY) value = Math.max(value, shift);
++            return value;
++        }
++
+         private static float interpolate(float[] values, int x0, int y0, int x1, int y1,
+                                          float fx, float fy) {
+             float top = values[y0 * MOTION_GRID_SIZE + x0]

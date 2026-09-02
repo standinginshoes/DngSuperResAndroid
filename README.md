@@ -9,7 +9,7 @@ An offline Android burst processor that aligns DNG/image frames, rejects poor ma
 - **150%:** a useful balance between denoising, detail recovery, memory, and processing time.
 - **200%:** maximum output detail when the burst contains useful sub-pixel handheld offsets.
 
-Higher resolution modes do not invent detail with a generative model. They combine differently shifted samples from the burst and interpolate the remaining output grid.
+Higher resolution modes do not invent detail with a generative model. The Bayer merge combines aligned samples from the burst at native resolution, then resamples the developed result to the selected dimensions.
 
 ## Output formats
 
@@ -17,9 +17,9 @@ Higher resolution modes do not invent detail with a generative model. They combi
 - **TIFF:** uncompressed 8-bit RGB.
 - **JPEG:** high-quality (95) compressed RGB for smaller files.
 
-The DNG output is a standards-based LinearRaw DNG, not the original Bayer sensor mosaic. The merge currently works on rendered RGB frames, so exporting to 16-bit DNG preserves a lossless linear container but cannot recreate sensor precision that was discarded during 8-bit rendering.
+The DNG output is a standards-based 16-bit LinearRaw DNG containing the developed merge, not a Bayer mosaic DNG. Bayer inputs are fused before demosaic, but the current Android bitmap result is rendered to sRGB before export; TIFF and DNG are therefore lossless containers for the rendered result rather than untouched sensor samples.
 
-## What v0.7 does
+## What v0.8 does
 
 - Android Storage Access Framework multi-select (no broad storage permission)
 - DNG providers with non-image MIME types are supported; bursts are capped at 30 frames
@@ -27,6 +27,12 @@ The DNG output is a standards-based LinearRaw DNG, not the original Bayer sensor
 - uncompressed RGB and LinearRaw DNG decoding for already-demosaiced camera output
 - CFA-metadata detection for files with nonstandard photometric tagging
 - disk-backed DNG input with row-sized read buffers to avoid whole-file heap allocations
+- tile-streamed Bayer CFA fusion that reads only the sensor rows required by each output stripe
+- per-frame linear-RAW exposure measurement using the DNG black and white levels
+- phase-preserving sub-pixel sampling on each Bayer color lattice before normalized fusion
+- full-resolution RAW-domain robust weights in addition to preview motion masks, reducing moving-subject ghosts
+- one edge-directed demosaic after stacking instead of demosaicing every input frame
+- automatic rendered-RGB compatibility fallback for unsupported DNG/image layouts
 - Android large-heap mode plus runtime memory checks for full-resolution fusion
 - black/white-level correction, Bayer demosaic, AsShotNeutral white balance, and DNG color-matrix rendering
 - Android `ImageDecoder` support for ordinary rendered image inputs
@@ -43,11 +49,11 @@ The DNG output is a standards-based LinearRaw DNG, not the original Bayer sensor
 - fully local/offline processing
 - 70 MP and device-memory safety checks with a clear suggestion to select a lower mode
 
-## Important limitation
+## Important limitations
 
-The app reads uncompressed Bayer DNG input directly, but it currently demosaics every frame before alignment and fusion. Its DNG export is therefore 16-bit LinearRaw RGB, not a new sensor-raw Bayer DNG. A future engine should align and merge the original CFA samples and demosaic only once after fusion. Compressed DNG variants are not yet supported by the built-in decoder.
+The RAW engine currently supports uncompressed 8–16-bit, standard 2×2 Bayer DNGs. Compressed DNGs, non-Bayer mosaics, differently sized frames, and rendered image inputs use the v0.7 RGB compatibility path. The four MotionCam-style packed 10-bit DNGs included in this project are the primary v0.8 target.
 
-The next major quality step is a native, tile-streamed CFA-domain kernel-regression engine. That architecture would retain the source bit depth, merge red/green/blue Bayer samples before demosaicing, steer reconstruction kernels along local edges, and normalize accumulated sample weights. v0.7 adopts its local-alignment and robustness principles while retaining the current memory-safe rendered-RGB pipeline.
+The merge is CFA-domain and preserves normalized sensor precision internally, but its saved DNG is currently developed 16-bit LinearRaw RGB rather than a newly encoded Bayer mosaic. A future native kernel-regression/Vulkan path could reconstruct directly onto a higher-resolution grid, add lens-shading and bad-pixel metadata handling, and stream a fused Bayer DNG without the Android bitmap stage.
 
 The design is informed by Google's published burst photography and handheld multi-frame super-resolution work:
 
@@ -65,6 +71,6 @@ From a configured command line environment, run `./gradlew assembleDebug` from t
 1. Remove generated desktop build artifacts from the vendored LibRaw tree and wire a minimal Android NDK build.
 2. Native Bayer DNG ingest plus metadata viewer (CFA, black/white level, ISO, exposure, color matrices).
 3. Pyramid and tile-local motion registration for rotation, parallax, and moving subjects.
-4. CFA-domain kernel-regression fusion with confidence weights.
-5. 16-bit TIFF and standards-compliant DNG output.
+4. Steered kernel-regression reconstruction directly on the selected output grid.
+5. Fused Bayer DNG plus true 16-bit RGB TIFF output.
 6. Vulkan/GPU compute path for alignment and reconstruction.

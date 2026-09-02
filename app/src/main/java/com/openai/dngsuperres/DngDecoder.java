@@ -11,6 +11,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.RandomAccessFile;
+import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -58,6 +59,36 @@ final class DngDecoder {
     };
 
     private DngDecoder() { }
+
+    static RawFrame openRaw(Context context, Uri uri) throws IOException {
+        File cachedDng = copyToCache(context.getContentResolver(), uri, context.getCacheDir());
+        RandomAccessFile file = null;
+        try {
+            file = new RandomAccessFile(cachedDng, "r");
+            Tiff tiff = new Tiff(file);
+            Ifd imageIfd = tiff.findBestImageIfd();
+            int photometric = imageIfd.intValue(TAG_PHOTOMETRIC, -1);
+            if (photometric != PHOTOMETRIC_CFA && !imageIfd.entries.containsKey(TAG_CFA_PATTERN)) {
+                throw new IOException("The selected DNG is not a Bayer CFA image.");
+            }
+            RawIfd raw = new RawIfd(imageIfd);
+            if (raw.compression != COMPRESSION_NONE) {
+                throw new IOException("RAW stacking does not yet support DNG compression " + raw.compression + ".");
+            }
+            if (raw.cfaWidth != 2 || raw.cfaHeight != 2 || raw.cfaPattern.length < 4) {
+                throw new IOException("RAW stacking requires a standard 2×2 Bayer pattern.");
+            }
+            if (raw.bitsPerSample < 8 || raw.bitsPerSample > 16) {
+                throw new IOException("RAW stacking does not support " + raw.bitsPerSample + "-bit samples.");
+            }
+            return new RawFrame(cachedDng, file, tiff.littleEndian, raw);
+        } catch (Throwable error) {
+            if (file != null) try { file.close(); } catch (IOException ignored) { }
+            if (!cachedDng.delete()) cachedDng.deleteOnExit();
+            if (error instanceof IOException) throw (IOException)error;
+            throw new IOException("Could not open Bayer data from this DNG.", error);
+        }
+    }
 
     static Bitmap decode(Context context, Uri uri, int maxDimension) throws IOException {
         File cachedDng = copyToCache(context.getContentResolver(), uri, context.getCacheDir());
@@ -363,6 +394,132 @@ final class DngDecoder {
                 (m[1] * m[6] - m[0] * m[7]) * inverse,
                 (m[0] * m[4] - m[1] * m[3]) * inverse
         };
+    }
+
+    static final class RawFrame implements Closeable {
+        final int width;
+        final int height;
+        final int bitsPerSample;
+        final int cfaWidth;
+        final int cfaHeight;
+        final int[] cfaPattern;
+        final float[] asShotNeutral;
+        final float[] cameraToXyz;
+        final float[] rgbMatrix;
+        private final File cachedDng;
+        private final RandomAccessFile file;
+        private final boolean littleEndian;
+        private final RawIfd raw;
+        private final int rowBytes;
+        private final byte[] packedRow;
+        private boolean closed;
+
+        RawFrame(File cachedDng, RandomAccessFile file, boolean littleEndian, RawIfd raw)
+                throws IOException {
+            this.cachedDng = cachedDng;
+            this.file = file;
+            this.littleEndian = littleEndian;
+            this.raw = raw;
+            width = raw.width;
+            height = raw.height;
+            bitsPerSample = raw.bitsPerSample;
+            cfaWidth = raw.cfaWidth;
+            cfaHeight = raw.cfaHeight;
+            cfaPattern = raw.cfaPattern.clone();
+            asShotNeutral = raw.asShotNeutral.clone();
+            cameraToXyz = raw.cameraToXyz.clone();
+            rgbMatrix = multiply3x3(XYZ_D50_TO_SRGB, cameraToXyz);
+            long bytes = ((long)width * bitsPerSample + 7L) / 8L;
+            if (bytes <= 0 || bytes > Integer.MAX_VALUE) throw new IOException("RAW DNG row is too large.");
+            rowBytes = (int)bytes;
+            packedRow = new byte[rowBytes];
+        }
+
+        synchronized short[] readRows(int firstRow, int rowCount) throws IOException {
+            if (closed) throw new IOException("RAW DNG reader is closed.");
+            if (firstRow < 0 || rowCount < 0 || firstRow + rowCount > height) {
+                throw new IOException("Requested RAW rows are outside the image.");
+            }
+            long samples = (long)width * rowCount;
+            if (samples > Integer.MAX_VALUE) throw new IOException("Requested RAW stripe is too large.");
+            short[] output = new short[(int)samples];
+            for (int localY = 0; localY < rowCount; localY++) {
+                int sourceY = firstRow + localY;
+                int strip = Math.min(raw.stripOffsets.length - 1, sourceY / raw.rowsPerStrip);
+                int rowInStrip = sourceY - strip * raw.rowsPerStrip;
+                long rowOffset = raw.stripOffsets[strip] + (long)rowInStrip * rowBytes;
+                if (rowOffset < 0 || rowOffset + rowBytes > file.length()) {
+                    throw new IOException("RAW DNG pixel strip is truncated.");
+                }
+                file.seek(rowOffset);
+                file.readFully(packedRow);
+                unpackRow(packedRow, output, localY * width);
+            }
+            return output;
+        }
+
+        int cfaColor(int x, int y) {
+            return cfaPattern[Math.floorMod(y, cfaHeight) * cfaWidth + Math.floorMod(x, cfaWidth)];
+        }
+
+        float normalized(int value, int x, int y) {
+            int blackIndex = Math.floorMod(y, raw.blackHeight) * raw.blackWidth
+                    + Math.floorMod(x, raw.blackWidth);
+            float black = raw.blackLevel[Math.min(blackIndex, raw.blackLevel.length - 1)];
+            return Math.max(0f, Math.min(1f,
+                    (value - black) / Math.max(1f, raw.whiteLevel - black)));
+        }
+
+        int renderSrgb(float red, float green, float blue) {
+            float redBalance = asShotNeutral.length >= 3 && asShotNeutral[0] > 0f
+                    ? asShotNeutral[1] / asShotNeutral[0] : 1f;
+            float blueBalance = asShotNeutral.length >= 3 && asShotNeutral[2] > 0f
+                    ? asShotNeutral[1] / asShotNeutral[2] : 1f;
+            red *= redBalance;
+            blue *= blueBalance;
+            float linearRed = rgbMatrix[0] * red + rgbMatrix[1] * green + rgbMatrix[2] * blue;
+            float linearGreen = rgbMatrix[3] * red + rgbMatrix[4] * green + rgbMatrix[5] * blue;
+            float linearBlue = rgbMatrix[6] * red + rgbMatrix[7] * green + rgbMatrix[8] * blue;
+            return Color.rgb(toSrgb8(linearRed), toSrgb8(linearGreen), toSrgb8(linearBlue));
+        }
+
+        private void unpackRow(byte[] source, short[] destination, int destinationOffset) throws IOException {
+            if (bitsPerSample == 16) {
+                for (int x = 0; x < width; x++) {
+                    int offset = x * 2;
+                    int value = littleEndian
+                            ? (source[offset] & 255) | ((source[offset + 1] & 255) << 8)
+                            : ((source[offset] & 255) << 8) | (source[offset + 1] & 255);
+                    destination[destinationOffset + x] = (short)value;
+                }
+            } else if (bitsPerSample == 8) {
+                for (int x = 0; x < width; x++) destination[destinationOffset + x] = (short)(source[x] & 255);
+            } else {
+                int mask = (1 << bitsPerSample) - 1;
+                for (int x = 0; x < width; x++) {
+                    int bit = x * bitsPerSample;
+                    int offset = bit >>> 3;
+                    int bitInByte = bit & 7;
+                    int packed = (source[offset] & 255) << 16;
+                    if (offset + 1 < rowBytes) packed |= (source[offset + 1] & 255) << 8;
+                    if (offset + 2 < rowBytes) packed |= source[offset + 2] & 255;
+                    int shift = 24 - bitInByte - bitsPerSample;
+                    if (shift < 0) throw new IOException("Unsupported packed RAW row alignment.");
+                    destination[destinationOffset + x] = (short)((packed >>> shift) & mask);
+                }
+            }
+        }
+
+        @Override
+        public synchronized void close() throws IOException {
+            if (closed) return;
+            closed = true;
+            try {
+                file.close();
+            } finally {
+                if (!cachedDng.delete()) cachedDng.deleteOnExit();
+            }
+        }
     }
 
     private static final class RgbIfd {
